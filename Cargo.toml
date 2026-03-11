@@ -1,0 +1,40 @@
+[package]
+name = "rust-highperf-server"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance multithreaded HTTP web server"
+
+[dependencies]
+# Async runtime and networking
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# Middleware and utilities
+tower = { version = "0.4", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# HTTP parsing
+httparse = "1.8"
+
+# Filesystem & speed
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "server_bench"
+harness = false
