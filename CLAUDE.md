@@ -1,4 +1,4 @@
-# CLAUDE.md - High-Performance Multithreaded HTTP Web Server
+# CLAUDE.md - High-Performance Multithreaded HTTP/HTTPS Web Server
 
 ## Build & Test Commands
 - Build: `cargo build`
@@ -44,13 +44,14 @@ src/
 ```
 
 ## Project Context
-Building a high-performance HTTP server targeting 50k+ req/sec. Performance and memory safety are top priorities. Key design decisions:
+Building a production-ready, high-performance HTTP/HTTPS server targeting 50k+ req/sec. Performance and memory safety are top priorities. Key design decisions:
 - Tokio multi-threaded runtime (worker threads = CPU cores)
 - Hyper for HTTP/1.1 protocol handling
 - Tower Service trait for composable middleware
 - Zero-copy parsing where possible (httparse, Bytes)
 - Token-bucket rate limiting per client IP
 - Async file I/O with streaming (no full-file buffering)
+- **TLS strategy:** HTTP for all development phases and benchmarking (TLS overhead would skew perf numbers). HTTPS via `rustls` + `hyper-rustls` added in Phase 7 — pure Rust, no OpenSSL dependency, production-grade.
 
 ## Phases
 1. **Foundation & Networking** — Tokio runtime, TCP listener, connection management
@@ -59,3 +60,4 @@ Building a high-performance HTTP server targeting 50k+ req/sec. Performance and 
 4. **Middleware & Features** — Static files, structured logging, rate limiting
 5. **Optimization** — Memory pooling (Bytes), keep-alive, backpressure
 6. **Testing & Benchmarking** — Unit tests, integration tests, wrk/hey load testing
+7. **HTTPS / TLS** — `rustls` + `hyper-rustls`, self-signed certs for dev, Let's Encrypt / cert loading for production, HTTP→HTTPS redirect
