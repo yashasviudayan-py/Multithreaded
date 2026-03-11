@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "A high-performance production-ready multithreaded HTTP/HTTPS web server"
 
+[features]
+default = []
+# Phase 7: Enable HTTPS via rustls (uncomment deps in Cargo.toml when activating)
+https = []
+# Phase 4+: Enable Prometheus-compatible metrics endpoint
+metrics = []
+
 [dependencies]
 # Async runtime and networking
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "time", "signal", "macros"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 bytes = "1"
 
@@ -43,3 +50,14 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 [[bench]]
 name = "server_bench"
 harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"        # Faster than "fat" with near-identical gains
+codegen-units = 1   # Single unit for maximum inlining
+panic = "abort"     # Smaller binary, faster — no unwinding in production
+strip = "debuginfo" # Remove debug info but keep symbols for backtraces
+
+[profile.bench]
+inherits = "release"
+debug = true        # Keep debug info for profiling with perf/flamegraph

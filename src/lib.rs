@@ -7,6 +7,7 @@
 //! - Streaming static file serving
 //! - Structured logging via tracing
 
+pub mod config;
 pub mod http;
 pub mod middleware;
 pub mod server;
