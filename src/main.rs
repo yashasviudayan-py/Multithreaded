@@ -3,6 +3,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use rust_highperf_server::config::ServerConfig;
+use rust_highperf_server::server::Server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,7 +11,8 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
         )
         .init();
 
@@ -21,6 +23,8 @@ async fn main() -> Result<()> {
         "rust-highperf-server starting up"
     );
 
-    // Server bootstrap will be implemented in Phase 1
+    Server::new(config).run().await?;
+
+    info!("Server shut down cleanly");
     Ok(())
 }

@@ -103,10 +103,14 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Serialize env-mutating tests so they don't race each other.
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn defaults_load_without_env() {
-        // Unset any env vars that could bleed in from the shell
+        let _guard = ENV_LOCK.lock().unwrap();
         for key in &["HOST", "PORT", "WORKERS", "LOG_LEVEL", "STATIC_DIR"] {
             env::remove_var(key);
         }
@@ -121,6 +125,7 @@ mod tests {
 
     #[test]
     fn invalid_port_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("PORT", "notaport");
         let result = ServerConfig::from_env();
         env::remove_var("PORT");
