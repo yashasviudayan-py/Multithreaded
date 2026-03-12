@@ -40,12 +40,13 @@ impl Server {
 
     /// Bind to `config.addr` and run the accept loop until `Ctrl-C` or `SIGTERM`.
     pub async fn run(self) -> Result<(), ServerError> {
-        let listener = TcpListener::bind(self.config.addr)
-            .await
-            .map_err(|e| ServerError::Bind {
-                addr: self.config.addr,
-                source: e,
-            })?;
+        let listener =
+            TcpListener::bind(self.config.addr)
+                .await
+                .map_err(|e| ServerError::Bind {
+                    addr: self.config.addr,
+                    source: e,
+                })?;
         self.accept_loop(listener, None, shutdown_signal()).await
     }
 
@@ -58,12 +59,13 @@ impl Server {
         self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), ServerError> {
-        let listener = TcpListener::bind(self.config.addr)
-            .await
-            .map_err(|e| ServerError::Bind {
-                addr: self.config.addr,
-                source: e,
-            })?;
+        let listener =
+            TcpListener::bind(self.config.addr)
+                .await
+                .map_err(|e| ServerError::Bind {
+                    addr: self.config.addr,
+                    source: e,
+                })?;
         self.accept_loop(listener, None, shutdown).await
     }
 
@@ -210,10 +212,16 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn test_config(port: u16) -> ServerConfig {
-        let mut cfg = ServerConfig::from_env().unwrap();
-        cfg.addr = SocketAddr::from(([127, 0, 0, 1], port));
-        cfg.max_connections = 4;
-        cfg
+        ServerConfig {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            workers: 1,
+            log_level: "info".to_string(),
+            static_dir: "./static".to_string(),
+            rate_limit_rps: 100,
+            max_connections: 4,
+            tls_cert_path: None,
+            tls_key_path: None,
+        }
     }
 
     /// Server signals readiness and shuts down cleanly via synthetic shutdown.
@@ -225,9 +233,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let mut cfg = ServerConfig::from_env().unwrap();
-        cfg.addr = addr;
-        cfg.max_connections = 4;
+        let cfg = ServerConfig {
+            addr,
+            workers: 1,
+            log_level: "info".to_string(),
+            static_dir: "./static".to_string(),
+            rate_limit_rps: 100,
+            max_connections: 4,
+            tls_cert_path: None,
+            tls_key_path: None,
+        };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
@@ -236,11 +251,9 @@ mod tests {
         shutdown_tx.send(()).unwrap();
 
         let result = Server::new(cfg)
-            .run_on_listener(
-                listener,
-                Some(ready_tx),
-                async move { let _ = shutdown_rx.await; },
-            )
+            .run_on_listener(listener, Some(ready_tx), async move {
+                let _ = shutdown_rx.await;
+            })
             .await;
 
         assert!(result.is_ok());

@@ -27,20 +27,25 @@ where
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let mut cfg = ServerConfig::from_env().unwrap();
-    cfg.max_connections = 64;
-    cfg.addr = listener.local_addr().unwrap(); // informational only
+    let cfg = ServerConfig {
+        addr: listener.local_addr().unwrap(),
+        workers: 2,
+        log_level: "info".to_string(),
+        static_dir: "./static".to_string(),
+        rate_limit_rps: 1000,
+        max_connections: 64,
+        tls_cert_path: None,
+        tls_key_path: None,
+    };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
 
     let server_task = tokio::spawn(async move {
         Server::new(cfg)
-            .run_on_listener(
-                listener,
-                Some(ready_tx),
-                async move { let _ = shutdown_rx.await; },
-            )
+            .run_on_listener(listener, Some(ready_tx), async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .expect("server task failed");
     });
@@ -100,9 +105,9 @@ async fn concurrent_connections_succeed() {
         let handles: Vec<_> = (0..10)
             .map(|_| {
                 let url = format!("http://{addr}/health");
-                tokio::spawn(async move {
-                    reqwest::get(&url).await.expect("request failed").status()
-                })
+                tokio::spawn(
+                    async move { reqwest::get(&url).await.expect("request failed").status() },
+                )
             })
             .collect();
 

@@ -51,9 +51,9 @@ pub async fn handle_connection(
             if let Err(e) = body.collect().await {
                 // Client disconnected mid-upload — log and close.
                 warn!(peer = %peer_addr, err = %e, "Failed to drain request body");
-                return Ok::<Response<Full<Bytes>>, Infallible>(
-                    build_error_response(StatusCode::BAD_REQUEST),
-                );
+                return Ok::<Response<Full<Bytes>>, Infallible>(build_error_response(
+                    StatusCode::BAD_REQUEST,
+                ));
             }
 
             let req = Request::from_parts(parts, ());
@@ -157,19 +157,30 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    fn test_config() -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            workers: 1,
+            log_level: "info".to_string(),
+            static_dir: "./static".to_string(),
+            rate_limit_rps: 100,
+            max_connections: 4,
+            tls_cert_path: None,
+            tls_key_path: None,
+        }
+    }
+
     #[test]
     fn route_health_path() {
         let req = dummy_request("/health");
-        let cfg = crate::config::ServerConfig::from_env().unwrap();
-        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &cfg);
+        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &test_config());
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
     fn route_unknown_path_returns_200() {
         let req = dummy_request("/anything");
-        let cfg = crate::config::ServerConfig::from_env().unwrap();
-        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &cfg);
+        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &test_config());
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
