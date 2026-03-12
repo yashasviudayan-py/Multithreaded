@@ -3,9 +3,11 @@
 pub mod connection;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
@@ -36,15 +38,22 @@ impl Server {
         Self { config }
     }
 
-    /// Bind the TCP listener and run the accept loop until `Ctrl-C` or `SIGTERM`.
+    /// Bind to `config.addr` and run the accept loop until `Ctrl-C` or `SIGTERM`.
     pub async fn run(self) -> Result<(), ServerError> {
-        self.run_with_shutdown(shutdown_signal()).await
+        let listener = TcpListener::bind(self.config.addr)
+            .await
+            .map_err(|e| ServerError::Bind {
+                addr: self.config.addr,
+                source: e,
+            })?;
+        self.accept_loop(listener, None, shutdown_signal()).await
     }
 
-    /// Like [`run`], but accepts an arbitrary future as the shutdown signal.
+    /// Like [`run`], but with a custom shutdown future.
     ///
-    /// Useful in tests: pass a `tokio::sync::oneshot` receiver so you can
-    /// trigger shutdown programmatically without sending a real OS signal.
+    /// Binds `config.addr` internally, then runs the accept loop until `shutdown`
+    /// resolves.  Useful when you need custom shutdown logic (e.g., draining
+    /// in-flight work before exit) without the OS signal handler.
     pub async fn run_with_shutdown(
         self,
         shutdown: impl Future<Output = ()>,
@@ -55,8 +64,43 @@ impl Server {
                 addr: self.config.addr,
                 source: e,
             })?;
+        self.accept_loop(listener, None, shutdown).await
+    }
 
-        info!(addr = %self.config.addr, max_connections = self.config.max_connections, "Listening for connections");
+    /// Run on a **pre-bound** listener with an optional ready-signal channel.
+    ///
+    /// This is the preferred entry point for tests: the caller binds the port
+    /// and keeps the `TcpListener` alive, eliminating the TOCTOU race that
+    /// would exist if we bound, dropped, and re-bound on the same port.
+    ///
+    /// `ready_tx` — if provided — is sent the bound `SocketAddr` immediately
+    /// before the accept loop starts, letting callers synchronise on server
+    /// readiness without a sleep.
+    pub async fn run_on_listener(
+        self,
+        listener: TcpListener,
+        ready_tx: Option<oneshot::Sender<SocketAddr>>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), ServerError> {
+        self.accept_loop(listener, ready_tx, shutdown).await
+    }
+
+    /// Internal accept loop shared by all public entry points.
+    async fn accept_loop(
+        self,
+        listener: TcpListener,
+        ready_tx: Option<oneshot::Sender<SocketAddr>>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), ServerError> {
+        let addr = listener.local_addr()?;
+
+        info!(addr = %addr, max_connections = self.config.max_connections, "Listening for connections");
+
+        // Notify tests (or any orchestrator) that we are ready to accept.
+        if let Some(tx) = ready_tx {
+            // Receiver may already be gone if the caller timed out — that's fine.
+            let _ = tx.send(addr);
+        }
 
         // Semaphore enforces the connection cap.  Each spawned task holds one
         // permit for the lifetime of the connection; `try_acquire_owned` is
@@ -123,25 +167,38 @@ impl Server {
 }
 
 /// Resolves on the first of `SIGINT` (`Ctrl-C`) or `SIGTERM`.
+///
+/// Falls back gracefully if signal registration fails instead of panicking:
+/// a failed SIGTERM handler is logged as a warning and only SIGINT is used.
 async fn shutdown_signal() {
     use tokio::signal;
 
     #[cfg(unix)]
     {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-
-        tokio::select! {
-            _ = signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!(
+                    err = %e,
+                    "Could not register SIGTERM handler; only SIGINT (Ctrl-C) will trigger shutdown"
+                );
+                // Best-effort: if ctrl_c also fails there's nothing we can do.
+                let _ = signal::ctrl_c().await;
+            }
         }
     }
 
     #[cfg(not(unix))]
     {
-        signal::ctrl_c()
-            .await
-            .expect("failed to listen for Ctrl-C");
+        // On non-Unix platforms only Ctrl-C is available.
+        if let Err(e) = signal::ctrl_c().await {
+            warn!(err = %e, "Could not listen for Ctrl-C shutdown signal");
+        }
     }
 }
 
@@ -150,6 +207,7 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use std::net::SocketAddr;
+    use tokio::sync::oneshot;
 
     fn test_config(port: u16) -> ServerConfig {
         let mut cfg = ServerConfig::from_env().unwrap();
@@ -158,27 +216,36 @@ mod tests {
         cfg
     }
 
-    /// Server binds successfully and shuts down immediately via a synthetic signal.
+    /// Server signals readiness and shuts down cleanly via synthetic shutdown.
+    ///
+    /// Uses `run_on_listener` with a pre-bound listener — no TOCTOU race,
+    /// no sleep: we wait on the ready channel instead.
     #[tokio::test]
     async fn server_binds_and_shuts_down() {
-        // Pre-resolve a real free port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
-        let mut cfg2 = ServerConfig::from_env().unwrap();
-        cfg2.addr = addr;
-        cfg2.max_connections = 4;
+        let mut cfg = ServerConfig::from_env().unwrap();
+        cfg.addr = addr;
+        cfg.max_connections = 4;
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        // Trigger shutdown immediately.
-        let _ = tx.send(());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
 
-        let result = Server::new(cfg2)
-            .run_with_shutdown(async move { let _ = rx.await; })
+        // Signal shutdown immediately so the server exits as soon as it's ready.
+        shutdown_tx.send(()).unwrap();
+
+        let result = Server::new(cfg)
+            .run_on_listener(
+                listener,
+                Some(ready_tx),
+                async move { let _ = shutdown_rx.await; },
+            )
             .await;
 
         assert!(result.is_ok());
+        // Server should have sent its bound address before entering the loop.
+        assert_eq!(ready_rx.await.unwrap(), addr);
     }
 
     /// `Server::new` stores the config unchanged.

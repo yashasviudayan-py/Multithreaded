@@ -66,9 +66,18 @@ impl ServerConfig {
             .map_err(|_| ConfigError::InvalidAddr(addr_str.clone()))?;
 
         let workers = match env::var("WORKERS") {
-            Ok(v) => v
-                .parse::<usize>()
-                .map_err(|_| ConfigError::InvalidValue("WORKERS".into(), v))?,
+            Ok(v) => {
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidValue("WORKERS".into(), v.clone()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidValue(
+                        "WORKERS".into(),
+                        "must be > 0".into(),
+                    ));
+                }
+                n
+            }
             Err(_) => std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
@@ -81,11 +90,23 @@ impl ServerConfig {
         let rate_limit_rps: u32 = rps_str
             .parse()
             .map_err(|_| ConfigError::InvalidValue("RATE_LIMIT_RPS".into(), rps_str.clone()))?;
+        if rate_limit_rps == 0 {
+            return Err(ConfigError::InvalidValue(
+                "RATE_LIMIT_RPS".into(),
+                "must be > 0".into(),
+            ));
+        }
 
         let conn_str = env::var("MAX_CONNECTIONS").unwrap_or_else(|_| "10000".to_string());
         let max_connections: usize = conn_str
             .parse()
             .map_err(|_| ConfigError::InvalidValue("MAX_CONNECTIONS".into(), conn_str.clone()))?;
+        if max_connections == 0 {
+            return Err(ConfigError::InvalidValue(
+                "MAX_CONNECTIONS".into(),
+                "must be > 0".into(),
+            ));
+        }
 
         Ok(Self {
             addr,
@@ -129,6 +150,33 @@ mod tests {
         env::set_var("PORT", "notaport");
         let result = ServerConfig::from_env();
         env::remove_var("PORT");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_max_connections_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("MAX_CONNECTIONS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("MAX_CONNECTIONS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_rate_limit_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RATE_LIMIT_RPS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("RATE_LIMIT_RPS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_workers_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("WORKERS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("WORKERS");
         assert!(result.is_err());
     }
 }

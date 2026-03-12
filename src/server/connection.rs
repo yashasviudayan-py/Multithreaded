@@ -9,24 +9,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::config::ServerConfig;
 
 /// Drive a single accepted TCP connection to completion.
 ///
 /// Wraps `stream` in a Hyper HTTP/1.1 connection, dispatches every request
-/// through [`service`], and logs errors.  The function is `async` and runs
-/// inside a dedicated `tokio::spawn` task.
-///
-/// The connection holds a semaphore permit (passed by the accept loop via a
-/// moved local variable `_permit`) that is released when this function returns.
+/// through the service function, and logs errors.  Runs inside a dedicated
+/// `tokio::spawn` task; the semaphore permit is moved in by the caller.
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -37,10 +34,31 @@ pub async fn handle_connection(
     // `TokioIo` bridges Tokio's `AsyncRead`/`AsyncWrite` to Hyper's `IO` trait.
     let io = TokioIo::new(stream);
 
-    // Clone peer_addr into the service closure (cheap — it's Copy).
     let service = hyper::service::service_fn(move |req: Request<Incoming>| {
         let cfg = Arc::clone(&config);
-        async move { Ok::<Response<Full<Bytes>>, Infallible>(route(req, peer_addr, &cfg)) }
+        async move {
+            let (parts, body) = req.into_parts();
+
+            // Drain the request body before routing.
+            //
+            // HTTP/1.1 keep-alive requires that the server either (a) fully
+            // reads the request body or (b) closes the connection.  If we skip
+            // this, any request with a body (POST, PUT, PATCH) will disable
+            // keep-alive for that exchange, degrading throughput.
+            //
+            // We discard the collected bytes; the body is consumed only to
+            // advance the TCP stream to the next request boundary.
+            if let Err(e) = body.collect().await {
+                // Client disconnected mid-upload — log and close.
+                warn!(peer = %peer_addr, err = %e, "Failed to drain request body");
+                return Ok::<Response<Full<Bytes>>, Infallible>(
+                    build_error_response(StatusCode::BAD_REQUEST),
+                );
+            }
+
+            let req = Request::from_parts(parts, ());
+            Ok::<Response<Full<Bytes>>, Infallible>(route(req, peer_addr, &cfg))
+        }
     });
 
     match http1::Builder::new()
@@ -63,29 +81,41 @@ pub async fn handle_connection(
 
 /// Dispatch an HTTP request and return a response.
 ///
-/// In Phase 1 this is a minimal placeholder that always returns `200 OK`.
-/// Phase 2 will replace this with the real router.
-fn route(req: Request<Incoming>, _peer: SocketAddr, _cfg: &ServerConfig) -> Response<Full<Bytes>> {
-    let path = req.uri().path();
-
-    // Minimal routing: health-check endpoint + catch-all.
-    match path {
+/// In Phase 1 this is a minimal placeholder.  Phase 2 wires up the real router.
+/// The body has already been consumed by the time this is called.
+fn route(req: Request<()>, _peer: SocketAddr, _cfg: &ServerConfig) -> Response<Full<Bytes>> {
+    match req.uri().path() {
         "/health" => build_response(StatusCode::OK, "ok\n"),
-        _ => build_response(
-            StatusCode::OK,
-            "Hello from rust-highperf-server\n",
-        ),
+        _ => build_response(StatusCode::OK, "Hello from rust-highperf-server\n"),
     }
 }
 
-/// Build a plain-text response with the given status and body.
+/// Build a plain-text `200 OK` (or other status) response with a static body.
 fn build_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
-    Response::builder()
+    // All inputs are compile-time constants: status is a valid HTTP status and
+    // header values are ASCII strings, so the builder cannot fail here.
+    match Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .header("server", "rust-highperf-server/0.1")
         .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .expect("response builder is infallible with valid inputs")
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Should be unreachable with static inputs, but avoid a panic.
+            error!(err = %e, "Failed to build response — returning 500");
+            build_error_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Build a minimal error response with an empty body.
+fn build_error_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("server", "rust-highperf-server/0.1")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
 #[cfg(test)]
@@ -98,7 +128,7 @@ mod tests {
             .method(Method::GET)
             .uri(path)
             .body(())
-            .unwrap()
+            .unwrap_or_else(|_| panic!("invalid test URI: {path}"))
     }
 
     #[test]
@@ -122,9 +152,24 @@ mod tests {
     }
 
     #[test]
-    fn dummy_request_compiles() {
-        // Ensure the helper compiles; actual routing tests are in integration tests.
+    fn build_error_response_has_status() {
+        let resp = build_error_response(StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn route_health_path() {
         let req = dummy_request("/health");
-        assert_eq!(req.uri().path(), "/health");
+        let cfg = crate::config::ServerConfig::from_env().unwrap();
+        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &cfg);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn route_unknown_path_returns_200() {
+        let req = dummy_request("/anything");
+        let cfg = crate::config::ServerConfig::from_env().unwrap();
+        let resp = route(req, "127.0.0.1:1234".parse().unwrap(), &cfg);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
