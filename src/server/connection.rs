@@ -120,6 +120,7 @@ mod tests {
         Arc::new(ServerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             workers: 1,
+            max_blocking_threads: 8,
             log_level: "info".to_string(),
             static_dir: "./static".to_string(),
             rate_limit_rps: 100,

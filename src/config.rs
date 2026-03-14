@@ -14,6 +14,11 @@ pub struct ServerConfig {
     pub addr: SocketAddr,
     /// Number of Tokio worker threads. Defaults to CPU core count.
     pub workers: usize,
+    /// Max threads in Tokio's blocking thread pool (`spawn_blocking`).
+    ///
+    /// These threads handle CPU-bound or blocking I/O work that must not
+    /// run on the async worker threads.  Defaults to 512.
+    pub max_blocking_threads: usize,
     /// Log level filter string (e.g., `"info"`, `"debug"`, `"error"`).
     pub log_level: String,
     /// Directory to serve static files from.
@@ -41,17 +46,18 @@ impl ServerConfig {
     /// Load configuration from environment variables with sensible defaults.
     ///
     /// # Environment Variables
-    /// | Variable          | Default       | Description                              |
-    /// |-------------------|---------------|------------------------------------------|
-    /// | `HOST`            | `0.0.0.0`     | Bind address                             |
-    /// | `PORT`            | `8080`        | Bind port                                |
-    /// | `WORKERS`         | CPU count     | Tokio worker thread count                |
-    /// | `LOG_LEVEL`       | `info`        | Tracing log filter                       |
-    /// | `STATIC_DIR`      | `./static`    | Static files directory                   |
-    /// | `RATE_LIMIT_RPS`  | `100`         | Requests/sec per IP                      |
-    /// | `MAX_CONNECTIONS` | `10000`       | Max concurrent connections               |
-    /// | `TLS_CERT_PATH`   | —             | TLS cert path (Phase 7)                  |
-    /// | `TLS_KEY_PATH`    | —             | TLS key path (Phase 7)                   |
+    /// | Variable            | Default       | Description                              |
+    /// |---------------------|---------------|------------------------------------------|
+    /// | `HOST`              | `0.0.0.0`     | Bind address                             |
+    /// | `PORT`              | `8080`        | Bind port                                |
+    /// | `WORKERS`           | CPU count     | Tokio worker thread count                |
+    /// | `BLOCKING_THREADS`  | `512`         | Tokio blocking thread pool size          |
+    /// | `LOG_LEVEL`         | `info`        | Tracing log filter                       |
+    /// | `STATIC_DIR`        | `./static`    | Static files directory                   |
+    /// | `RATE_LIMIT_RPS`    | `100`         | Requests/sec per IP                      |
+    /// | `MAX_CONNECTIONS`   | `10000`       | Max concurrent connections               |
+    /// | `TLS_CERT_PATH`     | —             | TLS cert path (Phase 7)                  |
+    /// | `TLS_KEY_PATH`      | —             | TLS key path (Phase 7)                   |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -83,6 +89,17 @@ impl ServerConfig {
                 .unwrap_or(4),
         };
 
+        let blocking_str = env::var("BLOCKING_THREADS").unwrap_or_else(|_| "512".to_string());
+        let max_blocking_threads: usize = blocking_str.parse().map_err(|_| {
+            ConfigError::InvalidValue("BLOCKING_THREADS".into(), blocking_str.clone())
+        })?;
+        if max_blocking_threads == 0 {
+            return Err(ConfigError::InvalidValue(
+                "BLOCKING_THREADS".into(),
+                "must be > 0".into(),
+            ));
+        }
+
         let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         let static_dir = env::var("STATIC_DIR").unwrap_or_else(|_| "./static".to_string());
 
@@ -111,6 +128,7 @@ impl ServerConfig {
         Ok(Self {
             addr,
             workers,
+            max_blocking_threads,
             log_level,
             static_dir,
             rate_limit_rps,
@@ -132,16 +150,33 @@ mod tests {
     #[test]
     fn defaults_load_without_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        for key in &["HOST", "PORT", "WORKERS", "LOG_LEVEL", "STATIC_DIR"] {
+        for key in &[
+            "HOST",
+            "PORT",
+            "WORKERS",
+            "BLOCKING_THREADS",
+            "LOG_LEVEL",
+            "STATIC_DIR",
+        ] {
             env::remove_var(key);
         }
         let cfg = ServerConfig::from_env().expect("config should load with defaults");
         assert_eq!(cfg.addr.port(), 8080);
+        assert_eq!(cfg.max_blocking_threads, 512);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.static_dir, "./static");
         assert_eq!(cfg.rate_limit_rps, 100);
         assert_eq!(cfg.max_connections, 10000);
         assert!(cfg.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn zero_blocking_threads_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("BLOCKING_THREADS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("BLOCKING_THREADS");
+        assert!(result.is_err());
     }
 
     #[test]

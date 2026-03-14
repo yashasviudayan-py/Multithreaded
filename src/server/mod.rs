@@ -215,6 +215,7 @@ mod tests {
         ServerConfig {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             workers: 1,
+            max_blocking_threads: 8,
             log_level: "info".to_string(),
             static_dir: "./static".to_string(),
             rate_limit_rps: 100,
@@ -236,6 +237,7 @@ mod tests {
         let cfg = ServerConfig {
             addr,
             workers: 1,
+            max_blocking_threads: 8,
             log_level: "info".to_string(),
             static_dir: "./static".to_string(),
             rate_limit_rps: 100,
