@@ -21,6 +21,7 @@ use crate::config::ServerConfig;
 use crate::http::request::HttpRequest;
 use crate::http::response::{HttpResponse, ResponseBuilder};
 use crate::http::router::Router;
+use crate::server::task::run_blocking;
 
 /// Drive a single accepted TCP connection to completion.
 ///
@@ -105,7 +106,42 @@ fn build_router(_cfg: &ServerConfig) -> Router {
         ResponseBuilder::ok().text(format!("{msg}\n"))
     });
 
+    // CPU-bound demo route added in Phase 3.
+    //
+    // Computes the n-th Fibonacci number on the blocking thread pool so the
+    // async workers stay free.  Caps `n` at 50 to prevent runaway computation
+    // (fib(50) already takes ~100 ms with the naive recursive algorithm, which
+    // is enough to demonstrate the blocking pool without overloading tests).
+    router.get("/fib/:n", |req| async move {
+        let n: u64 = req
+            .path_param("n")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+            .min(50);
+
+        match run_blocking(move || fib(n)).await {
+            Ok(result) => ResponseBuilder::ok().text(format!("{result}\n")),
+            Err(e) => {
+                tracing::error!(err = %e, "Blocking fib task failed");
+                ResponseBuilder::internal_error().empty()
+            }
+        }
+    });
+
     router
+}
+
+/// Compute the n-th Fibonacci number iteratively.
+///
+/// Intentionally CPU-bound (for large n) to demonstrate [`run_blocking`]
+/// keeping async workers free.  Safe for all u64 n (returns 0 for n == 0,
+/// wraps on overflow beyond fib(93) but the `/fib/:n` route caps at 50).
+fn fib(n: u64) -> u64 {
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 0..n {
+        (a, b) = (b, a.wrapping_add(b));
+    }
+    a
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -178,6 +214,33 @@ mod tests {
         let router = build_router(&cfg);
         let resp = router.dispatch(make_req(Method::GET, "/not-a-route")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn fib_known_values() {
+        assert_eq!(fib(0), 0);
+        assert_eq!(fib(1), 1);
+        assert_eq!(fib(10), 55);
+        assert_eq!(fib(20), 6765);
+    }
+
+    #[tokio::test]
+    async fn fib_route_returns_correct_value() {
+        let cfg = test_config();
+        let router = build_router(&cfg);
+        let resp = router.dispatch(make_req(Method::GET, "/fib/10")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_str(resp).await, "55\n");
+    }
+
+    #[tokio::test]
+    async fn fib_route_caps_at_50() {
+        let cfg = test_config();
+        let router = build_router(&cfg);
+        // n=999 should be capped to 50 → fib(50) = 12586269025
+        let resp = router.dispatch(make_req(Method::GET, "/fib/999")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_str(resp).await, "12586269025\n");
     }
 
     #[tokio::test]
