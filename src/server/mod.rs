@@ -1,6 +1,7 @@
 //! Server module: TCP listener, connection accept loop, and graceful shutdown.
 
 pub mod connection;
+pub mod task;
 
 use std::future::Future;
 use std::net::SocketAddr;
