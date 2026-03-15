@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::config::ServerConfig;
+use crate::middleware::RateLimiter;
 use crate::server::connection::handle_connection;
 
 /// Errors that can occur while binding or running the server.
@@ -110,6 +111,11 @@ impl Server {
         // non-blocking — if we're at the limit we drop the socket immediately
         // rather than queuing indefinitely (DoS mitigation).
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections));
+
+        // Shared token-bucket rate limiter state.  Created once here and
+        // passed into every connection task so all connections for the same IP
+        // share the same bucket.
+        let rate_limiter = Arc::new(RateLimiter::new(self.config.rate_limit_rps));
         let config = Arc::new(self.config);
 
         // Pin the shutdown future so we can poll it across loop iterations
@@ -138,11 +144,12 @@ impl Server {
                             match Arc::clone(&connection_limit).try_acquire_owned() {
                                 Ok(permit) => {
                                     let cfg = Arc::clone(&config);
+                                    let rl = Arc::clone(&rate_limiter);
                                     tokio::spawn(async move {
                                         // Permit is released when the task exits,
                                         // even on panic (Drop is always called).
                                         let _permit = permit;
-                                        handle_connection(stream, peer_addr, cfg).await;
+                                        handle_connection(stream, peer_addr, cfg, rl).await;
                                     });
                                 }
                                 Err(_) => {
@@ -223,6 +230,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            max_body_bytes: 4_194_304,
         }
     }
 
@@ -245,6 +253,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            max_body_bytes: 4_194_304,
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

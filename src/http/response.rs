@@ -2,22 +2,44 @@
 //!
 //! [`ResponseBuilder`] provides a fluent API for constructing [`HttpResponse`]
 //! values.  All responses automatically include the `server` header.
+//!
+//! The body type is [`HttpBody`] — a boxed, type-erased body that works for
+//! both in-memory responses (via [`Full<Bytes>`]) and future streaming responses
+//! (Phase 5+).  Use [`full_body`] to wrap a [`Bytes`] buffer.
+
+use std::convert::Infallible;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
 use hyper::{Response, StatusCode};
 use serde::Serialize;
 use tracing::error;
 
-/// A fully-constructed HTTP response ready to hand to Hyper.
+/// Type-erased HTTP body.
 ///
-/// Uses [`Full<Bytes>`] as the body type, which is efficient for the
-/// in-memory responses produced by Phase 2 handlers.  Phase 4 (static
-/// file serving) will extend this to a boxed/streaming body type.
-pub type HttpResponse = Response<Full<Bytes>>;
+/// Uses [`BoxBody<Bytes, Infallible>`] so in-memory and streaming bodies share
+/// one concrete type.  The error type is [`Infallible`] because all I/O errors
+/// must be handled *before* placing bytes in the body (e.g., file-read errors
+/// become `404`/`500` responses rather than mid-body failures).
+pub type HttpBody = BoxBody<Bytes, Infallible>;
+
+/// A fully-constructed HTTP response ready to hand to Hyper.
+pub type HttpResponse = Response<HttpBody>;
 
 /// The value sent in the `server` response header on every response.
 pub const SERVER_HEADER: &str = "rust-highperf-server/0.1";
+
+/// Wrap a [`Bytes`] buffer in an [`HttpBody`].
+///
+/// This is the canonical way to create an owned, in-memory body for use with
+/// [`ResponseBuilder`] or any code that constructs [`HttpResponse`] values
+/// directly.
+pub fn full_body(bytes: Bytes) -> HttpBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
 
 /// Fluent builder for [`HttpResponse`] values.
 ///
@@ -120,7 +142,7 @@ impl ResponseBuilder {
             builder = builder.header(key, val);
         }
 
-        match builder.body(Full::new(body)) {
+        match builder.body(full_body(body)) {
             Ok(resp) => resp,
             Err(e) => {
                 // Should be unreachable with the inputs we control.
@@ -128,8 +150,8 @@ impl ResponseBuilder {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("server", SERVER_HEADER)
-                    .body(Full::new(Bytes::from_static(b"Internal Server Error\n")))
-                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+                    .body(full_body(Bytes::from_static(b"Internal Server Error\n")))
+                    .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
             }
         }
     }
@@ -203,5 +225,13 @@ mod tests {
         let resp = ResponseBuilder::ok().empty();
         assert_eq!(resp.headers().get("content-length").unwrap(), "0");
         assert!(body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_body_helper_roundtrips_bytes() {
+        let original = Bytes::from_static(b"test data");
+        let body = full_body(original.clone());
+        let collected = body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected, original);
     }
 }

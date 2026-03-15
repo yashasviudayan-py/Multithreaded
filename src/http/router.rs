@@ -39,6 +39,9 @@ enum PathSegment {
     Literal(String),
     /// A named capture (`:name`) that matches any single component.
     Param(String),
+    /// A greedy capture (`*name`) that matches all remaining path components
+    /// as a single `/`-joined string.  Must appear as the **last** segment.
+    Wildcard(String),
 }
 
 /// A registered route: method + compiled pattern + handler.
@@ -175,12 +178,20 @@ impl Default for Router {
 // ── Path pattern helpers ──────────────────────────────────────────────────────
 
 /// Parse a pattern string like `"/users/:id/posts"` into a vec of segments.
+///
+/// Supported segment syntax:
+/// - `literal`  — exact match
+/// - `:name`    — captures one path component into `name`
+/// - `*name`    — greedy capture; matches all remaining components joined by
+///   `/`.  Only valid as the last segment.
 fn parse_pattern(pattern: &str) -> Vec<PathSegment> {
     pattern
         .split('/')
         .filter(|s| !s.is_empty())
         .map(|seg| {
-            if let Some(name) = seg.strip_prefix(':') {
+            if let Some(name) = seg.strip_prefix('*') {
+                PathSegment::Wildcard(name.to_string())
+            } else if let Some(name) = seg.strip_prefix(':') {
                 PathSegment::Param(name.to_string())
             } else {
                 PathSegment::Literal(seg.to_string())
@@ -197,20 +208,40 @@ impl RouteEntry {
     fn match_path(&self, path: &str) -> Option<HashMap<String, String>> {
         let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-        if path_segs.len() != self.segments.len() {
+        let has_wildcard = matches!(self.segments.last(), Some(PathSegment::Wildcard(_)));
+
+        if has_wildcard {
+            // Wildcard can match 0 or more trailing segments; all prefix
+            // segments before it must still match.
+            let prefix_len = self.segments.len().saturating_sub(1);
+            if path_segs.len() < prefix_len {
+                return None;
+            }
+        } else if path_segs.len() != self.segments.len() {
             return None;
         }
 
         let mut params = HashMap::new();
-        for (pattern_seg, path_seg) in self.segments.iter().zip(path_segs.iter()) {
+        for (i, pattern_seg) in self.segments.iter().enumerate() {
             match pattern_seg {
                 PathSegment::Literal(lit) => {
-                    if lit != path_seg {
+                    if path_segs.get(i).is_none_or(|s| s != lit) {
                         return None;
                     }
                 }
-                PathSegment::Param(name) => {
-                    params.insert(name.clone(), path_seg.to_string());
+                PathSegment::Param(name) => match path_segs.get(i) {
+                    Some(s) => {
+                        params.insert(name.clone(), (*s).to_string());
+                    }
+                    None => return None,
+                },
+                PathSegment::Wildcard(name) => {
+                    // Capture remaining segments (may be empty if wildcard is
+                    // at the end and the URL ends right at the prefix).
+                    if i < path_segs.len() {
+                        params.insert(name.clone(), path_segs[i..].join("/"));
+                    }
+                    return Some(params);
                 }
             }
         }
@@ -310,6 +341,36 @@ mod tests {
             let resp = router.dispatch(make_req(method, "/ping")).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn wildcard_captures_single_segment() {
+        let mut router = Router::new();
+        router.get("/files/*path", |req| async move {
+            let p = req.path_param("path").unwrap_or("").to_string();
+            ResponseBuilder::ok().text(format!("{p}\n"))
+        });
+        let resp = router
+            .dispatch(make_req(Method::GET, "/files/readme.txt"))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"readme.txt\n");
+    }
+
+    #[tokio::test]
+    async fn wildcard_captures_deep_path() {
+        let mut router = Router::new();
+        router.get("/files/*path", |req| async move {
+            let p = req.path_param("path").unwrap_or("").to_string();
+            ResponseBuilder::ok().text(format!("{p}\n"))
+        });
+        let resp = router
+            .dispatch(make_req(Method::GET, "/files/css/style.css"))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"css/style.css\n");
     }
 
     #[tokio::test]

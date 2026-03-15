@@ -2,62 +2,97 @@
 //!
 //! Each accepted TCP stream is driven here inside its own `tokio::spawn` task.
 //! Hyper manages keep-alive, pipelining, and framing; this module builds the
-//! application [`Router`] and dispatches every request through it.
+//! application [`Router`] and dispatches every request through it via a
+//! composed Tower middleware stack:
+//!
+//! ```text
+//! LoggingLayer  ←  outermost (measures full latency, logs status)
+//!   └─ RateLimiterLayer  (per-IP token-bucket; returns 429 on exhaustion)
+//!        └─ service_fn  (collect body, enforce size limit, dispatch to Router)
+//! ```
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
-use hyper::Request;
+use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpStream;
+use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
 
 use crate::config::ServerConfig;
 use crate::http::request::HttpRequest;
 use crate::http::response::{HttpResponse, ResponseBuilder};
 use crate::http::router::Router;
+use crate::middleware::{LoggingLayer, RateLimiter, RateLimiterLayer};
 use crate::server::task::run_blocking;
+use crate::static_files;
 
 /// Drive a single accepted TCP connection to completion.
 ///
-/// Wraps `stream` in a Hyper HTTP/1.1 connection, dispatches every request
-/// through the application [`Router`], and logs errors.  Runs inside a
-/// dedicated `tokio::spawn` task; the semaphore permit is moved in by the
-/// caller.
+/// Wraps `stream` in a Hyper HTTP/1.1 connection, runs requests through a
+/// Tower middleware stack (logging → rate limiting → router dispatch), and
+/// logs errors.  Runs inside a dedicated `tokio::spawn` task; the semaphore
+/// permit is moved in by the caller and released on task exit.
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
+    rate_limiter: Arc<RateLimiter>,
 ) {
     debug!(peer = %peer_addr, "Connection accepted");
 
     // Build the router once per connection; all keep-alive requests on this
     // connection share the same Arc<Router>.
     let router = Arc::new(build_router(&config));
+    let max_body = config.max_body_bytes;
 
-    let io = TokioIo::new(stream);
-
-    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+    // ── Inner service: body collection + dispatch ──────────────────────────
+    // Use tower::service_fn (not hyper::service::service_fn) so the result
+    // implements tower::Service and can be composed with Tower middleware layers.
+    let inner = tower::service_fn(move |req: Request<Incoming>| {
         let router = Arc::clone(&router);
         async move {
             let (parts, body) = req.into_parts();
 
-            // Collect the request body.
-            //
-            // HTTP/1.1 keep-alive requires the server to fully read (or close)
-            // the request body before the next request on the same connection
-            // can begin.  We pass the collected bytes to HttpRequest rather
-            // than discarding them, so handlers can inspect the body.
+            // Enforce body size limit before collecting.  Check Content-Length
+            // for an early, cheap rejection of well-behaved clients.
+            if let Some(cl) = parts
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if cl > max_body {
+                    return Ok::<HttpResponse, Infallible>(
+                        ResponseBuilder::new(StatusCode::PAYLOAD_TOO_LARGE)
+                            .text("413 Payload Too Large\n"),
+                    );
+                }
+            }
+
+            // HTTP/1.1 keep-alive requires the server to fully consume the
+            // request body before the next request on the same connection can
+            // begin.  Collect and enforce the runtime limit.
             let body_bytes: Bytes = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
+                Ok(collected) => {
+                    let bytes = collected.to_bytes();
+                    if bytes.len() > max_body {
+                        return Ok(ResponseBuilder::new(StatusCode::PAYLOAD_TOO_LARGE)
+                            .text("413 Payload Too Large\n"));
+                    }
+                    bytes
+                }
                 Err(e) => {
                     warn!(peer = %peer_addr, err = %e, "Failed to collect request body");
-                    return Ok::<HttpResponse, Infallible>(ResponseBuilder::bad_request().empty());
+                    return Ok(ResponseBuilder::bad_request().empty());
                 }
             };
 
@@ -66,6 +101,18 @@ pub async fn handle_connection(
             Ok::<HttpResponse, Infallible>(response)
         }
     });
+
+    // ── Compose Tower middleware stack ─────────────────────────────────────
+    // Request flow: LoggingService → RateLimiterService → inner service_fn
+    // Wrapped in TowerToHyperService because Hyper 1.x uses its own Service
+    // trait (hyper::service::Service), which is different from tower::Service.
+    let tower_stack = ServiceBuilder::new()
+        .layer(LoggingLayer::new(peer_addr))
+        .layer(RateLimiterLayer::new(rate_limiter, peer_addr.ip()))
+        .service(inner);
+
+    let service = TowerToHyperService::new(tower_stack);
+    let io = TokioIo::new(stream);
 
     match http1::Builder::new()
         .keep_alive(true)
@@ -89,7 +136,7 @@ pub async fn handle_connection(
 /// developed.  The router is wrapped in an `Arc` by `handle_connection` so it
 /// is shared across all keep-alive requests on the same connection without
 /// cloning.
-fn build_router(_cfg: &ServerConfig) -> Router {
+fn build_router(cfg: &ServerConfig) -> Router {
     let mut router = Router::new();
 
     router.get("/", |_req| async {
@@ -128,6 +175,19 @@ fn build_router(_cfg: &ServerConfig) -> Router {
         }
     });
 
+    // Static file serving added in Phase 4.
+    //
+    // Files are served from `config.static_dir` relative to the server's
+    // working directory.  Path traversal attacks are blocked in `serve_file`.
+    let static_dir = PathBuf::from(&cfg.static_dir);
+    router.get("/static/*filepath", move |req| {
+        let base = static_dir.clone();
+        async move {
+            let filepath = req.path_param("filepath").unwrap_or("").to_string();
+            static_files::serve_file(&base, &filepath).await
+        }
+    });
+
     router
 }
 
@@ -163,6 +223,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            max_body_bytes: 4_194_304,
         })
     }
 
@@ -252,5 +313,15 @@ mod tests {
             resp.headers().get("server").unwrap(),
             "rust-highperf-server/0.1"
         );
+    }
+
+    #[tokio::test]
+    async fn static_route_returns_404_for_missing_file() {
+        let cfg = test_config();
+        let router = build_router(&cfg);
+        let resp = router
+            .dispatch(make_req(Method::GET, "/static/nonexistent.txt"))
+            .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
