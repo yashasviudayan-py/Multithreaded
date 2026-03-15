@@ -31,6 +31,11 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<String>,
     /// Path to TLS private key file. Phase 7: HTTPS.
     pub tls_key_path: Option<String>,
+    /// Maximum allowed request body size in bytes.
+    ///
+    /// Requests exceeding this limit receive a `413 Payload Too Large` response.
+    /// Defaults to 4 MiB (4,194,304 bytes).
+    pub max_body_bytes: usize,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -58,6 +63,7 @@ impl ServerConfig {
     /// | `MAX_CONNECTIONS`   | `10000`       | Max concurrent connections               |
     /// | `TLS_CERT_PATH`     | —             | TLS cert path (Phase 7)                  |
     /// | `TLS_KEY_PATH`      | —             | TLS key path (Phase 7)                   |
+    /// | `MAX_BODY_BYTES`    | `4194304`     | Max request body size (bytes)            |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -125,6 +131,17 @@ impl ServerConfig {
             ));
         }
 
+        let body_str = env::var("MAX_BODY_BYTES").unwrap_or_else(|_| "4194304".to_string());
+        let max_body_bytes: usize = body_str
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue("MAX_BODY_BYTES".into(), body_str.clone()))?;
+        if max_body_bytes == 0 {
+            return Err(ConfigError::InvalidValue(
+                "MAX_BODY_BYTES".into(),
+                "must be > 0".into(),
+            ));
+        }
+
         Ok(Self {
             addr,
             workers,
@@ -135,6 +152,7 @@ impl ServerConfig {
             max_connections,
             tls_cert_path: env::var("TLS_CERT_PATH").ok(),
             tls_key_path: env::var("TLS_KEY_PATH").ok(),
+            max_body_bytes,
         })
     }
 }
@@ -157,6 +175,7 @@ mod tests {
             "BLOCKING_THREADS",
             "LOG_LEVEL",
             "STATIC_DIR",
+            "MAX_BODY_BYTES",
         ] {
             env::remove_var(key);
         }
@@ -167,7 +186,17 @@ mod tests {
         assert_eq!(cfg.static_dir, "./static");
         assert_eq!(cfg.rate_limit_rps, 100);
         assert_eq!(cfg.max_connections, 10000);
+        assert_eq!(cfg.max_body_bytes, 4_194_304);
         assert!(cfg.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn zero_max_body_bytes_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("MAX_BODY_BYTES", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("MAX_BODY_BYTES");
+        assert!(result.is_err());
     }
 
     #[test]

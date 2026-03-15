@@ -33,12 +33,14 @@ where
     let cfg = ServerConfig {
         addr: listener.local_addr().unwrap(),
         workers: 2,
+        max_blocking_threads: 8,
         log_level: "error".to_string(), // suppress noise in test output
         static_dir: "./static".to_string(),
         rate_limit_rps: 1000,
         max_connections: 64,
         tls_cert_path: None,
         tls_key_path: None,
+        max_body_bytes: 4_194_304,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
