@@ -4,8 +4,9 @@
 //! values.  All responses automatically include the `server` header.
 //!
 //! The body type is [`HttpBody`] — a boxed, type-erased body that works for
-//! both in-memory responses (via [`Full<Bytes>`]) and future streaming responses
-//! (Phase 5+).  Use [`full_body`] to wrap a [`Bytes`] buffer.
+//! both in-memory responses (via [`Full<Bytes>`]) and streaming responses.
+//! Use [`full_body`] to wrap a [`Bytes`] buffer, or [`ResponseBuilder::stream_body`]
+//! to attach a streaming body with a pre-known content-length.
 
 use std::convert::Infallible;
 
@@ -127,6 +128,44 @@ impl ResponseBuilder {
     /// Finish the response with an empty body.
     pub fn empty(self) -> HttpResponse {
         self.build("text/plain; charset=utf-8", Bytes::new())
+    }
+
+    /// Finish the response with a streaming body of pre-known length.
+    ///
+    /// Unlike [`bytes_body`] this method does not buffer the entire content in
+    /// memory; it accepts an already-boxed [`HttpBody`] (e.g., from a
+    /// [`StreamBody`](http_body_util::StreamBody)) and records `content_length`
+    /// from metadata (e.g., file size returned by [`tokio::fs::metadata`]).
+    ///
+    /// Use this for large responses such as static files where buffering the
+    /// full content would waste memory.
+    pub fn stream_body(
+        self,
+        content_type: &'static str,
+        body: HttpBody,
+        content_length: u64,
+    ) -> HttpResponse {
+        let mut builder = Response::builder()
+            .status(self.status)
+            .header("content-type", content_type)
+            .header("content-length", content_length.to_string())
+            .header("server", SERVER_HEADER);
+
+        for (key, val) in self.extra_headers {
+            builder = builder.header(key, val);
+        }
+
+        match builder.body(body) {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(err = %e, "ResponseBuilder::stream_body failed — returning 500");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("server", SERVER_HEADER)
+                    .body(full_body(Bytes::from_static(b"Internal Server Error\n")))
+                    .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+            }
+        }
     }
 
     /// Assemble the final [`HttpResponse`].

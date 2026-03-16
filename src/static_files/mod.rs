@@ -1,17 +1,26 @@
-//! Static file serving with async I/O.
+//! Static file serving with async streaming I/O.
 //!
-//! [`serve_file`] reads a file from `base_dir` relative to the URL path
-//! component captured by the `*filepath` route wildcard.  It guards against
-//! path-traversal attacks by allowing only [`Normal`](std::path::Component::Normal)
-//! path components and rejecting any `..`, `.`, or absolute segments.
+//! [`serve_file`] streams a file from `base_dir` using [`tokio::fs::File`] +
+//! [`ReaderStream`] instead of reading the entire file into memory.  The
+//! `Content-Length` header is set from file metadata so clients know the size
+//! up front.
+//!
+//! ## Path-traversal protection
+//! Only [`Component::Normal`] segments are allowed.  Any `..`, `.`, absolute
+//! root, or prefix segment triggers an immediate `403 Forbidden`.
 
 pub mod mime;
 
+use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
 
 use bytes::Bytes;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Frame;
 use hyper::StatusCode;
-use tokio::fs;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 use tracing::error;
 
 use crate::http::response::{HttpResponse, ResponseBuilder};
@@ -20,6 +29,9 @@ use crate::http::response::{HttpResponse, ResponseBuilder};
 ///
 /// `req_path` is the path portion captured from the request URL (e.g.
 /// `"css/style.css"` from `/static/css/style.css`).
+///
+/// The file is streamed in chunks — it is never fully buffered in memory.
+/// `Content-Length` is taken from filesystem metadata before streaming begins.
 ///
 /// # Security
 /// Only [`Component::Normal`] path components are allowed.  Any segment that
@@ -45,8 +57,8 @@ pub async fn serve_file(base_dir: &Path, req_path: &str) -> HttpResponse {
 
     let target = base_dir.join(&safe_path);
 
-    // Async metadata read — non-blocking, uses the blocking thread pool.
-    let metadata = match fs::metadata(&target).await {
+    // Async metadata read — discovers size and whether target is a directory.
+    let metadata = match tokio::fs::metadata(&target).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return ResponseBuilder::not_found().text("404 Not Found\n");
@@ -64,20 +76,54 @@ pub async fn serve_file(base_dir: &Path, req_path: &str) -> HttpResponse {
         target
     };
 
-    // Async file read — non-blocking.
-    match fs::read(&file_path).await {
-        Ok(bytes) => {
-            let content_type = mime::from_path(&file_path);
-            ResponseBuilder::ok().bytes_body(content_type, Bytes::from(bytes))
-        }
+    // Re-stat the final path to get the correct file size (metadata above may
+    // be for the directory entry).
+    let file_meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            ResponseBuilder::not_found().text("404 Not Found\n")
+            return ResponseBuilder::not_found().text("404 Not Found\n");
         }
         Err(e) => {
-            error!(err = %e, path = ?file_path, "Failed to read static file");
-            ResponseBuilder::internal_error().text("500 Internal Server Error\n")
+            error!(err = %e, path = ?file_path, "Static file stat error");
+            return ResponseBuilder::internal_error().text("500 Internal Server Error\n");
         }
-    }
+    };
+    let file_size = file_meta.len();
+
+    // Open the file asynchronously.
+    let file = match File::open(&file_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ResponseBuilder::not_found().text("404 Not Found\n");
+        }
+        Err(e) => {
+            error!(err = %e, path = ?file_path, "Failed to open static file");
+            return ResponseBuilder::internal_error().text("500 Internal Server Error\n");
+        }
+    };
+
+    let content_type = mime::from_path(&file_path);
+
+    // Stream the file in chunks.  Any mid-stream I/O error is logged and the
+    // stream is terminated; the client will detect the truncation via the
+    // content-length mismatch.
+    let fp_for_log = file_path.clone();
+    let stream = ReaderStream::new(file).filter_map(move |result| {
+        let path = fp_for_log.clone();
+        async move {
+            match result {
+                Ok(chunk) => Some(Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk))),
+                Err(e) => {
+                    error!(err = %e, path = ?path, "File stream read error");
+                    None
+                }
+            }
+        }
+    });
+
+    let body = BodyExt::boxed(StreamBody::new(stream));
+
+    ResponseBuilder::ok().stream_body(content_type, body, file_size)
 }
 
 /// Strip a URL path to only its [`Normal`](Component::Normal) components,
