@@ -79,7 +79,10 @@ pub struct ConcurrencyLimiterService<S> {
 
 impl<S, ReqBody> Service<Request<ReqBody>> for ConcurrencyLimiterService<S>
 where
-    S: Service<Request<ReqBody>, Response = HttpResponse, Error = Infallible> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = HttpResponse, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
     ReqBody: Send + 'static,
 {
@@ -103,11 +106,11 @@ where
             }
             Err(_) => {
                 debug!("Concurrency limit reached — returning 503");
-                Box::pin(std::future::ready(Ok(
-                    ResponseBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("retry-after", "1")
-                        .text("503 Service Unavailable\n"),
-                )))
+                Box::pin(std::future::ready(Ok(ResponseBuilder::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+                .header("retry-after", "1")
+                .text("503 Service Unavailable\n"))))
             }
         }
     }

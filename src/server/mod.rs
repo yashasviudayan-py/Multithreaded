@@ -116,8 +116,7 @@ impl Server {
 
         // Semaphore for server-wide in-flight request concurrency.  Shared
         // across all connections so one slow wave can't monopolise all workers.
-        let concurrency_limiter =
-            Arc::new(Semaphore::new(self.config.max_concurrent_requests));
+        let concurrency_limiter = Arc::new(Semaphore::new(self.config.max_concurrent_requests));
 
         // Shared token-bucket rate limiter state.  Created once here and
         // passed into every connection task so all connections for the same IP
@@ -219,8 +218,7 @@ impl Server {
             tokio::pin!(draining);
 
             if in_flight.load(Ordering::Acquire) > 0 {
-                let drain_timeout =
-                    Duration::from_secs(config.shutdown_drain_secs);
+                let drain_timeout = Duration::from_secs(config.shutdown_drain_secs);
                 match tokio::time::timeout(drain_timeout, draining).await {
                     Ok(()) => info!("All in-flight connections drained"),
                     Err(_) => warn!(

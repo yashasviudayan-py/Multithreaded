@@ -136,8 +136,7 @@ pub async fn handle_connection(
     tokio::pin!(conn);
 
     // Keep-alive idle timeout: drop the connection if it sits idle for too long.
-    let ka_timeout =
-        tokio::time::sleep(Duration::from_secs(config.keep_alive_timeout_secs));
+    let ka_timeout = tokio::time::sleep(Duration::from_secs(config.keep_alive_timeout_secs));
     tokio::pin!(ka_timeout);
 
     // Track whether we have already initiated graceful shutdown on this

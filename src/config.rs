@@ -173,8 +173,7 @@ impl ServerConfig {
             ));
         }
 
-        let concur_str =
-            env::var("MAX_CONCURRENT_REQUESTS").unwrap_or_else(|_| "5000".to_string());
+        let concur_str = env::var("MAX_CONCURRENT_REQUESTS").unwrap_or_else(|_| "5000".to_string());
         let max_concurrent_requests: usize = concur_str.parse().map_err(|_| {
             ConfigError::InvalidValue("MAX_CONCURRENT_REQUESTS".into(), concur_str.clone())
         })?;
@@ -186,9 +185,9 @@ impl ServerConfig {
         }
 
         let drain_str = env::var("SHUTDOWN_DRAIN_SECS").unwrap_or_else(|_| "30".to_string());
-        let shutdown_drain_secs: u64 = drain_str
-            .parse()
-            .map_err(|_| ConfigError::InvalidValue("SHUTDOWN_DRAIN_SECS".into(), drain_str.clone()))?;
+        let shutdown_drain_secs: u64 = drain_str.parse().map_err(|_| {
+            ConfigError::InvalidValue("SHUTDOWN_DRAIN_SECS".into(), drain_str.clone())
+        })?;
 
         Ok(Self {
             addr,
