@@ -76,21 +76,9 @@ pub async fn serve_file(base_dir: &Path, req_path: &str) -> HttpResponse {
         target
     };
 
-    // Re-stat the final path to get the correct file size (metadata above may
-    // be for the directory entry).
-    let file_meta = match tokio::fs::metadata(&file_path).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ResponseBuilder::not_found().text("404 Not Found\n");
-        }
-        Err(e) => {
-            error!(err = %e, path = ?file_path, "Static file stat error");
-            return ResponseBuilder::internal_error().text("500 Internal Server Error\n");
-        }
-    };
-    let file_size = file_meta.len();
-
-    // Open the file asynchronously.
+    // Open the file asynchronously.  Getting the size from the open file
+    // handle (fstat) instead of a second fs::metadata() call avoids the
+    // TOCTOU window where the file could change between two separate stat calls.
     let file = match File::open(&file_path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -98,6 +86,15 @@ pub async fn serve_file(base_dir: &Path, req_path: &str) -> HttpResponse {
         }
         Err(e) => {
             error!(err = %e, path = ?file_path, "Failed to open static file");
+            return ResponseBuilder::internal_error().text("500 Internal Server Error\n");
+        }
+    };
+
+    // fstat the already-open file descriptor — atomic with the open above.
+    let file_size = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            error!(err = %e, path = ?file_path, "Failed to stat open static file");
             return ResponseBuilder::internal_error().text("500 Internal Server Error\n");
         }
     };

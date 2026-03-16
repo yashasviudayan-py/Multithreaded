@@ -24,9 +24,10 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use hyper::{Request, StatusCode};
@@ -34,6 +35,11 @@ use tower::{Layer, Service};
 use tracing::debug;
 
 use crate::http::response::{HttpResponse, ResponseBuilder};
+
+/// How often (in `check()` calls) to scan for stale buckets.
+const EVICT_EVERY_N_CHECKS: u64 = 10_000;
+/// Remove buckets that have not been accessed for longer than this.
+const STALE_BUCKET_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 // ── Token bucket ─────────────────────────────────────────────────────────────
 
@@ -87,9 +93,16 @@ impl TokenBucket {
 ///
 /// Uses [`DashMap`] for lock-free concurrent access across all connections.
 /// Create once at server startup and share via [`Arc`].
+///
+/// ## Memory management
+/// Every [`EVICT_EVERY_N_CHECKS`] calls to [`check`][Self::check], entries
+/// that have not been accessed for [`STALE_BUCKET_TTL`] are evicted to prevent
+/// unbounded growth when client IPs rotate (NAT pools, cloud deployments).
 pub struct RateLimiter {
     buckets: DashMap<IpAddr, TokenBucket>,
     rate_rps: u32,
+    /// Monotonically-increasing call counter used to schedule eviction sweeps.
+    check_count: AtomicU64,
 }
 
 impl RateLimiter {
@@ -98,6 +111,7 @@ impl RateLimiter {
         Self {
             buckets: DashMap::new(),
             rate_rps,
+            check_count: AtomicU64::new(0),
         }
     }
 
@@ -106,11 +120,43 @@ impl RateLimiter {
     /// Returns `true` if the request is within the rate limit, `false` if it
     /// should be rejected.  Creates a fresh bucket on the first request from
     /// each IP.
+    ///
+    /// Periodically evicts IP buckets that have been idle for
+    /// [`STALE_BUCKET_TTL`] to prevent unbounded [`DashMap`] growth.
     pub fn check(&self, ip: IpAddr) -> bool {
+        let n = self.check_count.fetch_add(1, AOrdering::Relaxed);
+        if n > 0 && n.is_multiple_of(EVICT_EVERY_N_CHECKS) {
+            self.evict_stale();
+        }
+
         self.buckets
             .entry(ip)
             .or_insert_with(|| TokenBucket::new(self.rate_rps))
             .try_consume()
+    }
+
+    /// Remove all buckets whose `last_refill` timestamp is older than
+    /// [`STALE_BUCKET_TTL`].
+    ///
+    /// Called automatically by [`check`][Self::check] every
+    /// [`EVICT_EVERY_N_CHECKS`] requests.  Uses [`DashMap::retain`] which
+    /// holds individual shard locks — not a stop-the-world operation.
+    fn evict_stale(&self) {
+        let cutoff = Instant::now()
+            .checked_sub(STALE_BUCKET_TTL)
+            .unwrap_or_else(Instant::now);
+        let before = self.buckets.len();
+        self.buckets
+            .retain(|_, bucket| bucket.last_refill >= cutoff);
+        let removed = before.saturating_sub(self.buckets.len());
+        if removed > 0 {
+            debug!(removed, "Evicted stale rate-limiter buckets");
+        }
+    }
+
+    /// Return the current number of tracked IP buckets (useful for monitoring).
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
     }
 }
 

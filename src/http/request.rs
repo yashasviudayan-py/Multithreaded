@@ -56,13 +56,15 @@ impl HttpRequest {
     /// Look up a single query parameter by name.
     ///
     /// Performs a linear scan of the `key=value` pairs in the query string.
+    /// Both the key comparison and the returned value are percent-decoded
+    /// (`%XX` → byte, `+` → space) and interpreted as UTF-8.
     /// Returns `None` if the key is absent or if there is no query string.
     pub fn query_param(&self, key: &str) -> Option<String> {
         self.uri.query()?.split('&').find_map(|pair| {
             let mut kv = pair.splitn(2, '=');
             let k = kv.next()?;
-            if k == key {
-                Some(kv.next().unwrap_or("").to_string())
+            if percent_decode(k) == key {
+                Some(percent_decode(kv.next().unwrap_or("")))
             } else {
                 None
             }
@@ -84,6 +86,36 @@ impl HttpRequest {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
+}
+
+/// Percent-decode a URL-encoded string (`%XX` sequences and `+` as space).
+///
+/// Decodes valid `%HH` hex sequences into their byte values and then
+/// interprets the result as UTF-8.  Invalid sequences (non-hex digits, or
+/// decoded bytes that form invalid UTF-8) are passed through unchanged.
+fn percent_decode(s: &str) -> String {
+    let s = s.replace('+', " ");
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        // Decoded bytes are not valid UTF-8 (e.g. lone high bytes) — return
+        // the original undecoded string rather than panic or corrupt data.
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +175,28 @@ mod tests {
     fn body_bytes_stored() {
         let req = make_request(Method::POST, "/data", b"hello world");
         assert_eq!(req.body.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn query_param_percent_decoded() {
+        let req = make_request(Method::GET, "/search?q=hello%20world&lang=en", b"");
+        assert_eq!(req.query_param("q").as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn query_param_plus_decoded_as_space() {
+        let req = make_request(Method::GET, "/path?msg=hello+world", b"");
+        assert_eq!(req.query_param("msg").as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn percent_decode_roundtrip() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("foo%3Dbar"), "foo=bar");
+        assert_eq!(percent_decode("a+b+c"), "a b c");
+        assert_eq!(percent_decode("no_encoding"), "no_encoding");
+        assert_eq!(percent_decode("%"), "%"); // lone % passthrough
+        assert_eq!(percent_decode("%GG"), "%GG"); // non-hex passthrough
     }
 
     #[test]
