@@ -6,15 +6,29 @@
 //! composed Tower middleware stack:
 //!
 //! ```text
-//! LoggingLayer  ←  outermost (measures full latency, logs status)
-//!   └─ RateLimiterLayer  (per-IP token-bucket; returns 429 on exhaustion)
-//!        └─ service_fn  (collect body, enforce size limit, dispatch to Router)
+//! LoggingLayer          ←  outermost (measures full latency, logs status)
+//!   └─ RateLimiterLayer        (per-IP token-bucket; returns 429 on exhaustion)
+//!        └─ ConcurrencyLimiterLayer  (global cap; returns 503 when full)
+//!             └─ service_fn          (collect body, enforce size limit, dispatch)
 //! ```
+//!
+//! ## Graceful shutdown
+//! The accept loop passes a [`watch::Receiver<bool>`] that becomes `true` when
+//! a shutdown signal is received.  `handle_connection` detects this inside its
+//! `select!` loop and calls [`hyper::server::conn::http1::Connection::graceful_shutdown`],
+//! which sends `Connection: close` on the next response so the client knows not
+//! to reuse the connection.  The loop then runs to completion.
+//!
+//! ## Keep-alive timeout
+//! A [`tokio::time::sleep`] timer is armed when the connection is established.
+//! If it fires before the connection closes naturally the task exits, which
+//! drops the TCP stream and lets the OS close the socket.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -24,6 +38,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpStream;
+use tokio::sync::{watch, Semaphore};
 use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
 
@@ -31,21 +46,22 @@ use crate::config::ServerConfig;
 use crate::http::request::HttpRequest;
 use crate::http::response::{HttpResponse, ResponseBuilder};
 use crate::http::router::Router;
-use crate::middleware::{LoggingLayer, RateLimiter, RateLimiterLayer};
+use crate::middleware::{ConcurrencyLimiterLayer, LoggingLayer, RateLimiter, RateLimiterLayer};
 use crate::server::task::run_blocking;
 use crate::static_files;
 
 /// Drive a single accepted TCP connection to completion.
 ///
-/// Wraps `stream` in a Hyper HTTP/1.1 connection, runs requests through a
-/// Tower middleware stack (logging → rate limiting → router dispatch), and
-/// logs errors.  Runs inside a dedicated `tokio::spawn` task; the semaphore
-/// permit is moved in by the caller and released on task exit.
+/// Builds the Tower middleware stack and drives the Hyper HTTP/1.1 connection
+/// state machine.  The [`watch::Receiver`] is used to signal graceful shutdown
+/// across all active connections simultaneously.
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
     rate_limiter: Arc<RateLimiter>,
+    concurrency_limiter: Arc<Semaphore>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     debug!(peer = %peer_addr, "Connection accepted");
 
@@ -103,28 +119,61 @@ pub async fn handle_connection(
     });
 
     // ── Compose Tower middleware stack ─────────────────────────────────────
-    // Request flow: LoggingService → RateLimiterService → inner service_fn
-    // Wrapped in TowerToHyperService because Hyper 1.x uses its own Service
-    // trait (hyper::service::Service), which is different from tower::Service.
+    // Request flow: LoggingService → RateLimiterService → ConcurrencyLimiterService → inner
     let tower_stack = ServiceBuilder::new()
         .layer(LoggingLayer::new(peer_addr))
         .layer(RateLimiterLayer::new(rate_limiter, peer_addr.ip()))
+        .layer(ConcurrencyLimiterLayer::new(concurrency_limiter))
         .service(inner);
 
     let service = TowerToHyperService::new(tower_stack);
     let io = TokioIo::new(stream);
 
-    match http1::Builder::new()
+    // ── Drive connection with keep-alive timeout + graceful shutdown ───────
+    let conn = http1::Builder::new()
         .keep_alive(true)
-        .serve_connection(io, service)
-        .await
-    {
-        Ok(()) => debug!(peer = %peer_addr, "Connection closed cleanly"),
-        Err(e) => {
-            if e.is_incomplete_message() {
-                debug!(peer = %peer_addr, "Client disconnected mid-request");
-            } else {
-                error!(peer = %peer_addr, err = %e, "HTTP connection error");
+        .serve_connection(io, service);
+    tokio::pin!(conn);
+
+    // Keep-alive idle timeout: drop the connection if it sits idle for too long.
+    let ka_timeout =
+        tokio::time::sleep(Duration::from_secs(config.keep_alive_timeout_secs));
+    tokio::pin!(ka_timeout);
+
+    // Track whether we have already initiated graceful shutdown on this
+    // connection (prevents calling graceful_shutdown() more than once).
+    let mut graceful = false;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = &mut conn => {
+                match result {
+                    Ok(()) => debug!(peer = %peer_addr, "Connection closed cleanly"),
+                    Err(e) if e.is_incomplete_message() => {
+                        debug!(peer = %peer_addr, "Client disconnected mid-request")
+                    }
+                    Err(e) => error!(peer = %peer_addr, err = %e, "HTTP connection error"),
+                }
+                break;
+            }
+
+            // Listen for the server-wide graceful-shutdown broadcast.
+            _ = shutdown_rx.changed(), if !graceful => {
+                if *shutdown_rx.borrow() {
+                    graceful = true;
+                    debug!(peer = %peer_addr, "Graceful shutdown: sending Connection: close");
+                    conn.as_mut().graceful_shutdown();
+                }
+                // If the value changed but is still false (shouldn't happen),
+                // just continue polling.
+            }
+
+            // Keep-alive idle timeout: close the connection if unused too long.
+            _ = &mut ka_timeout, if !graceful => {
+                debug!(peer = %peer_addr, "Keep-alive timeout — closing idle connection");
+                break;
             }
         }
     }
@@ -136,7 +185,7 @@ pub async fn handle_connection(
 /// developed.  The router is wrapped in an `Arc` by `handle_connection` so it
 /// is shared across all keep-alive requests on the same connection without
 /// cloning.
-fn build_router(cfg: &ServerConfig) -> Router {
+pub(crate) fn build_router(cfg: &ServerConfig) -> Router {
     let mut router = Router::new();
 
     router.get("/", |_req| async {

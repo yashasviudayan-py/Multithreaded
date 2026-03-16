@@ -5,11 +5,13 @@ pub mod task;
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::config::ServerConfig;
@@ -112,11 +114,27 @@ impl Server {
         // rather than queuing indefinitely (DoS mitigation).
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections));
 
+        // Semaphore for server-wide in-flight request concurrency.  Shared
+        // across all connections so one slow wave can't monopolise all workers.
+        let concurrency_limiter =
+            Arc::new(Semaphore::new(self.config.max_concurrent_requests));
+
         // Shared token-bucket rate limiter state.  Created once here and
         // passed into every connection task so all connections for the same IP
         // share the same bucket.
         let rate_limiter = Arc::new(RateLimiter::new(self.config.rate_limit_rps));
         let config = Arc::new(self.config);
+
+        // Graceful-shutdown broadcast channel.  When the outer shutdown future
+        // resolves, we send `true` so every active connection can finish its
+        // current request and then close.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // In-flight connection counter + notification for the drain wait.
+        // The counter is incremented *before* spawning so there is no window
+        // where a connection exists but is not counted.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let all_drained = Arc::new(tokio::sync::Notify::new());
 
         // Pin the shutdown future so we can poll it across loop iterations
         // without re-registering OS signal handlers each time.
@@ -145,11 +163,24 @@ impl Server {
                                 Ok(permit) => {
                                     let cfg = Arc::clone(&config);
                                     let rl = Arc::clone(&rate_limiter);
+                                    let cl = Arc::clone(&concurrency_limiter);
+                                    let rx = shutdown_rx.clone();
+
+                                    // Increment before spawn — no gap where the
+                                    // task exists but is not counted.
+                                    in_flight.fetch_add(1, Ordering::Relaxed);
+                                    let counter = Arc::clone(&in_flight);
+                                    let notify = Arc::clone(&all_drained);
+
                                     tokio::spawn(async move {
                                         // Permit is released when the task exits,
                                         // even on panic (Drop is always called).
                                         let _permit = permit;
-                                        handle_connection(stream, peer_addr, cfg, rl).await;
+                                        handle_connection(stream, peer_addr, cfg, rl, cl, rx).await;
+                                        // Decrement; if we were the last one, wake the drain waiter.
+                                        if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                            notify.notify_one();
+                                        }
                                     });
                                 }
                                 Err(_) => {
@@ -164,10 +195,38 @@ impl Server {
                         }
                         Err(e) => {
                             // Transient OS errors (EMFILE, ENFILE) must not
-                            // crash the accept loop — log and continue.
+                            // crash the accept loop — log, yield briefly, continue.
                             error!(err = %e, "Accept error");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     }
+                }
+            }
+        }
+
+        // ── Graceful shutdown drain ───────────────────────────────────────────
+        // Signal all active connections to close after their current request.
+        let _ = shutdown_tx.send(true);
+
+        let remaining = in_flight.load(Ordering::Acquire);
+        if remaining > 0 {
+            info!(count = remaining, "Draining in-flight connections");
+
+            // Register the Notify listener *before* re-checking the counter so
+            // there is no race where the last task finishes between our load
+            // and the .await.
+            let draining = all_drained.notified();
+            tokio::pin!(draining);
+
+            if in_flight.load(Ordering::Acquire) > 0 {
+                let drain_timeout =
+                    Duration::from_secs(config.shutdown_drain_secs);
+                match tokio::time::timeout(drain_timeout, draining).await {
+                    Ok(()) => info!("All in-flight connections drained"),
+                    Err(_) => warn!(
+                        remaining = in_flight.load(Ordering::Relaxed),
+                        "Shutdown drain timeout exceeded; forcing exit"
+                    ),
                 }
             }
         }
