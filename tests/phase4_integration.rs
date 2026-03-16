@@ -34,6 +34,9 @@ where
         tls_cert_path: None,
         tls_key_path: None,
         max_body_bytes: 4_194_304,
+        keep_alive_timeout_secs: 75,
+        max_concurrent_requests: 5000,
+        shutdown_drain_secs: 5,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -75,6 +78,9 @@ where
         tls_cert_path: None,
         tls_key_path: None,
         max_body_bytes: 4_194_304,
+        keep_alive_timeout_secs: 75,
+        max_concurrent_requests: 5000,
+        shutdown_drain_secs: 5,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -116,6 +122,9 @@ where
         tls_cert_path: None,
         tls_key_path: None,
         max_body_bytes: max_bytes,
+        keep_alive_timeout_secs: 75,
+        max_concurrent_requests: 5000,
+        shutdown_drain_secs: 5,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

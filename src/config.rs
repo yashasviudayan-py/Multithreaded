@@ -36,6 +36,23 @@ pub struct ServerConfig {
     /// Requests exceeding this limit receive a `413 Payload Too Large` response.
     /// Defaults to 4 MiB (4,194,304 bytes).
     pub max_body_bytes: usize,
+    /// Idle keep-alive timeout in seconds.
+    ///
+    /// HTTP/1.1 connections with no in-flight request are closed after this
+    /// many seconds of inactivity.  Defaults to 75 s (matches nginx default).
+    pub keep_alive_timeout_secs: u64,
+    /// Maximum number of requests processed concurrently across all connections.
+    ///
+    /// Requests beyond this limit receive an immediate `503 Service Unavailable`.
+    /// This is a request-level limit; the connection-level limit is
+    /// [`max_connections`].  Defaults to 5 000.
+    pub max_concurrent_requests: usize,
+    /// Graceful-shutdown drain timeout in seconds.
+    ///
+    /// After a shutdown signal the server stops accepting new connections and
+    /// waits up to this many seconds for in-flight connections to close before
+    /// forcing exit.  Defaults to 30 s.
+    pub shutdown_drain_secs: u64,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -61,9 +78,12 @@ impl ServerConfig {
     /// | `STATIC_DIR`        | `./static`    | Static files directory                   |
     /// | `RATE_LIMIT_RPS`    | `100`         | Requests/sec per IP                      |
     /// | `MAX_CONNECTIONS`   | `10000`       | Max concurrent connections               |
-    /// | `TLS_CERT_PATH`     | —             | TLS cert path (Phase 7)                  |
-    /// | `TLS_KEY_PATH`      | —             | TLS key path (Phase 7)                   |
-    /// | `MAX_BODY_BYTES`    | `4194304`     | Max request body size (bytes)            |
+    /// | `TLS_CERT_PATH`          | —             | TLS cert path (Phase 7)                  |
+    /// | `TLS_KEY_PATH`           | —             | TLS key path (Phase 7)                   |
+    /// | `MAX_BODY_BYTES`         | `4194304`     | Max request body size (bytes)            |
+    /// | `KEEP_ALIVE_TIMEOUT`     | `75`          | Idle keep-alive timeout (seconds)        |
+    /// | `MAX_CONCURRENT_REQUESTS`| `5000`        | Max in-flight requests server-wide       |
+    /// | `SHUTDOWN_DRAIN_SECS`    | `30`          | Graceful-shutdown drain timeout (seconds)|
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -142,6 +162,34 @@ impl ServerConfig {
             ));
         }
 
+        let ka_str = env::var("KEEP_ALIVE_TIMEOUT").unwrap_or_else(|_| "75".to_string());
+        let keep_alive_timeout_secs: u64 = ka_str
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue("KEEP_ALIVE_TIMEOUT".into(), ka_str.clone()))?;
+        if keep_alive_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "KEEP_ALIVE_TIMEOUT".into(),
+                "must be > 0".into(),
+            ));
+        }
+
+        let concur_str =
+            env::var("MAX_CONCURRENT_REQUESTS").unwrap_or_else(|_| "5000".to_string());
+        let max_concurrent_requests: usize = concur_str.parse().map_err(|_| {
+            ConfigError::InvalidValue("MAX_CONCURRENT_REQUESTS".into(), concur_str.clone())
+        })?;
+        if max_concurrent_requests == 0 {
+            return Err(ConfigError::InvalidValue(
+                "MAX_CONCURRENT_REQUESTS".into(),
+                "must be > 0".into(),
+            ));
+        }
+
+        let drain_str = env::var("SHUTDOWN_DRAIN_SECS").unwrap_or_else(|_| "30".to_string());
+        let shutdown_drain_secs: u64 = drain_str
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue("SHUTDOWN_DRAIN_SECS".into(), drain_str.clone()))?;
+
         Ok(Self {
             addr,
             workers,
@@ -153,6 +201,9 @@ impl ServerConfig {
             tls_cert_path: env::var("TLS_CERT_PATH").ok(),
             tls_key_path: env::var("TLS_KEY_PATH").ok(),
             max_body_bytes,
+            keep_alive_timeout_secs,
+            max_concurrent_requests,
+            shutdown_drain_secs,
         })
     }
 }
@@ -187,6 +238,9 @@ mod tests {
         assert_eq!(cfg.rate_limit_rps, 100);
         assert_eq!(cfg.max_connections, 10000);
         assert_eq!(cfg.max_body_bytes, 4_194_304);
+        assert_eq!(cfg.keep_alive_timeout_secs, 75);
+        assert_eq!(cfg.max_concurrent_requests, 5000);
+        assert_eq!(cfg.shutdown_drain_secs, 30);
         assert!(cfg.tls_cert_path.is_none());
     }
 
@@ -241,6 +295,24 @@ mod tests {
         env::set_var("WORKERS", "0");
         let result = ServerConfig::from_env();
         env::remove_var("WORKERS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_keep_alive_timeout_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("KEEP_ALIVE_TIMEOUT", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("KEEP_ALIVE_TIMEOUT");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_max_concurrent_requests_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("MAX_CONCURRENT_REQUESTS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("MAX_CONCURRENT_REQUESTS");
         assert!(result.is_err());
     }
 }
