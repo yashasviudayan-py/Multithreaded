@@ -15,7 +15,7 @@ use hyper::{HeaderMap, Method, Uri};
 /// Created by the connection handler after collecting the incoming body into a
 /// [`Bytes`] buffer.  The router fills [`path_params`] before invoking the
 /// matched handler.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HttpRequest {
     /// HTTP method (GET, POST, PUT, DELETE, …).
     pub method: Method,
@@ -197,6 +197,49 @@ mod tests {
         assert_eq!(percent_decode("no_encoding"), "no_encoding");
         assert_eq!(percent_decode("%"), "%"); // lone % passthrough
         assert_eq!(percent_decode("%GG"), "%GG"); // non-hex passthrough
+    }
+
+    // ── Property-based tests ──────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `percent_decode` must never panic on any valid UTF-8 string.
+        #[test]
+        fn percent_decode_never_panics(s in ".*") {
+            let _ = percent_decode(&s);
+        }
+
+        /// Plain ASCII identifiers contain no percent-encoded sequences, so
+        /// `percent_decode` must return the input unchanged.
+        #[test]
+        fn percent_decode_plain_alnum_is_identity(s in "[a-zA-Z0-9_\\-]{0,64}") {
+            assert_eq!(percent_decode(&s), s);
+        }
+
+        /// `query_param` must never panic regardless of what the URI looks like.
+        #[test]
+        fn query_param_never_panics(
+            path  in "/[a-z/]{0,20}",
+            query in "[a-zA-Z0-9%+&=]{0,60}",
+            key   in "[a-zA-Z]{1,10}",
+        ) {
+            let uri = format!("{path}?{query}");
+            let req = make_request(Method::GET, &uri, b"");
+            let _ = req.query_param(&key);
+        }
+
+        /// A key present verbatim in the query string (no encoding needed) must
+        /// always be found by `query_param`.
+        #[test]
+        fn query_param_finds_plain_key(
+            key   in "[a-zA-Z]{1,10}",
+            value in "[a-zA-Z0-9]{1,10}",
+        ) {
+            let uri = format!("/?{key}={value}");
+            let req = make_request(Method::GET, &uri, b"");
+            assert_eq!(req.query_param(&key).as_deref(), Some(value.as_str()));
+        }
     }
 
     #[test]

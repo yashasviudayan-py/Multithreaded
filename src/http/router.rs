@@ -373,6 +373,61 @@ mod tests {
         assert_eq!(body.as_ref(), b"css/style.css\n");
     }
 
+    // ── Property-based tests ──────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `Router::dispatch` must never panic on any well-formed path segment.
+        #[test]
+        fn router_dispatch_never_panics(seg in "[a-zA-Z0-9_\\-]{1,20}") {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let router = router_under_test();
+            let path = format!("/{seg}");
+            let req = make_req(Method::GET, &path);
+            let _ = rt.block_on(router.dispatch(req));
+        }
+
+        /// `match_path` is deterministic: same input always returns the same result.
+        #[test]
+        fn match_path_is_deterministic(
+            seg1 in "[a-z]{1,10}",
+            seg2 in "[a-z]{1,10}",
+        ) {
+            let entry = RouteEntry {
+                method: Method::GET,
+                segments: parse_pattern("/users/:id"),
+                handler: Arc::new(|_req| {
+                    Box::pin(async { ResponseBuilder::ok().empty() }) as BoxFuture
+                }),
+            };
+            let path = format!("/{seg1}/{seg2}");
+            let r1 = entry.match_path(&path);
+            let r2 = entry.match_path(&path);
+            assert_eq!(r1.is_some(), r2.is_some());
+            if let (Some(p1), Some(p2)) = (r1, r2) {
+                assert_eq!(p1, p2);
+            }
+        }
+
+        /// A literal route must never match a path of a different length.
+        #[test]
+        fn literal_route_rejects_wrong_depth(extra in "[a-z]{1,10}") {
+            let entry = RouteEntry {
+                method: Method::GET,
+                segments: parse_pattern("/health"),
+                handler: Arc::new(|_req| {
+                    Box::pin(async { ResponseBuilder::ok().empty() }) as BoxFuture
+                }),
+            };
+            // "/health/<anything>" must not match the literal "/health" route.
+            let path = format!("/health/{extra}");
+            assert!(entry.match_path(&path).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn multiple_path_params_extracted() {
         let mut router = Router::new();
