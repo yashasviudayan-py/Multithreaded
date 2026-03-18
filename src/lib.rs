@@ -8,6 +8,7 @@
 //! - Structured logging via tracing
 
 pub mod config;
+pub mod db;
 pub mod http;
 pub mod middleware;
 pub mod server;

@@ -33,8 +33,9 @@ use tokio::sync::{watch, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfig;
-use crate::middleware::RateLimiter;
-use crate::server::connection::handle_connection;
+use crate::db;
+use crate::middleware::{JwtSecret, RateLimiter};
+use crate::server::connection::{handle_connection, AppState};
 use crate::tls::{load_tls_acceptor, TlsError};
 
 /// Errors that can occur while binding or running the server.
@@ -51,6 +52,9 @@ pub enum ServerError {
     /// TLS certificate/key loading failed at startup.
     #[error("TLS configuration error: {0}")]
     Tls(#[from] TlsError),
+    /// Database initialisation failed at startup.
+    #[error("Database error: {0}")]
+    Db(#[from] db::DbError),
 }
 
 /// The HTTP server: owns configuration and orchestrates accept/shutdown.
@@ -165,6 +169,13 @@ impl Server {
         // passed into every connection task so all connections for the same IP
         // share the same bucket.
         let rate_limiter = Arc::new(RateLimiter::new(self.config.rate_limit_rps));
+
+        // ── Phase 8: Database pool + JWT secret ───────────────────────────────
+        // Initialise SQLite connection pool once at startup and share via Arc.
+        let db_pool = Arc::new(db::init_pool(&self.config.db_url).await?);
+        let jwt = Arc::new(JwtSecret::new(&self.config.jwt_secret));
+        let app_state = AppState { db_pool, jwt };
+
         let config = Arc::new(self.config);
 
         // Graceful-shutdown broadcast channel.  When the outer shutdown future
@@ -230,11 +241,12 @@ impl Server {
                                         // TLS path: perform the handshake in the spawned task
                                         // so the accept loop is not blocked waiting for a slow client.
                                         let acceptor = acceptor.clone();
+                                        let state = app_state.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit;
                                             match acceptor.accept(stream).await {
                                                 Ok(tls_stream) => {
-                                                    handle_connection(tls_stream, peer_addr, cfg, rl, cl, rx).await;
+                                                    handle_connection(tls_stream, peer_addr, cfg, rl, cl, rx, state).await;
                                                 }
                                                 Err(e) => {
                                                     warn!(peer = %peer_addr, err = %e, "TLS handshake failed");
@@ -245,10 +257,11 @@ impl Server {
                                             }
                                         });
                                     } else {
-                                        // Plain HTTP path — same as before Phase 7.
+                                        // Plain HTTP path.
+                                        let state = app_state.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit;
-                                            handle_connection(stream, peer_addr, cfg, rl, cl, rx).await;
+                                            handle_connection(stream, peer_addr, cfg, rl, cl, rx, state).await;
                                             if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
                                                 notify.notify_one();
                                             }
@@ -481,6 +494,8 @@ mod tests {
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,
             shutdown_drain_secs: 30,
+            db_url: "sqlite::memory:".to_string(),
+            jwt_secret: "test-secret".to_string(),
         }
     }
 
@@ -508,6 +523,8 @@ mod tests {
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,
             shutdown_drain_secs: 30,
+            db_url: "sqlite::memory:".to_string(),
+            jwt_secret: "test-secret".to_string(),
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

@@ -45,6 +45,8 @@ where
         keep_alive_timeout_secs: 75,
         max_concurrent_requests: 5000,
         shutdown_drain_secs: 5,
+        db_url: "sqlite::memory:".to_string(),
+        jwt_secret: "test-secret".to_string(),
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

@@ -60,6 +60,16 @@ pub struct ServerConfig {
     /// waits up to this many seconds for in-flight connections to close before
     /// forcing exit.  Defaults to 30 s.
     pub shutdown_drain_secs: u64,
+    /// SQLite database URL (e.g., `sqlite:./data.db` or `sqlite::memory:`).
+    ///
+    /// Used by Phase 8 to store application data.  Defaults to
+    /// `sqlite:./data.db`.
+    pub db_url: String,
+    /// Secret key used to sign and verify JSON Web Tokens (JWT).
+    ///
+    /// **Must be changed in production.**  Defaults to a placeholder value
+    /// that will cause tests to warn loudly if left as-is.
+    pub jwt_secret: String,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -92,6 +102,8 @@ impl ServerConfig {
     /// | `KEEP_ALIVE_TIMEOUT`     | `75`          | Idle keep-alive timeout (seconds)        |
     /// | `MAX_CONCURRENT_REQUESTS`| `5000`        | Max in-flight requests server-wide       |
     /// | `SHUTDOWN_DRAIN_SECS`    | `30`          | Graceful-shutdown drain timeout (seconds)|
+    /// | `DATABASE_URL`           | `sqlite:./data.db` | SQLite database path              |
+    /// | `JWT_SECRET`             | `change-me-in-production` | JWT signing secret          |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -213,6 +225,10 @@ impl ServerConfig {
             Err(_) => None,
         };
 
+        let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./data.db".to_string());
+        let jwt_secret =
+            env::var("JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
+
         Ok(Self {
             addr,
             workers,
@@ -228,6 +244,8 @@ impl ServerConfig {
             keep_alive_timeout_secs,
             max_concurrent_requests,
             shutdown_drain_secs,
+            db_url,
+            jwt_secret,
         })
     }
 }
@@ -266,6 +284,8 @@ mod tests {
         assert_eq!(cfg.max_concurrent_requests, 5000);
         assert_eq!(cfg.shutdown_drain_secs, 30);
         assert!(cfg.tls_cert_path.is_none());
+        assert_eq!(cfg.db_url, "sqlite:./data.db");
+        assert_eq!(cfg.jwt_secret, "change-me-in-production");
     }
 
     #[test]

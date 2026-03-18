@@ -1,4 +1,4 @@
-//! Per-connection HTTP/1.1 handling via Hyper.
+//! Per-connection HTTP/1.1 and HTTP/2 handling via Hyper.
 //!
 //! Each accepted TCP stream is driven here inside its own `tokio::spawn` task.
 //! Hyper manages keep-alive, pipelining, and framing; this module builds the
@@ -12,12 +12,15 @@
 //!             └─ service_fn          (collect body, enforce size limit, dispatch)
 //! ```
 //!
+//! Protocol selection uses `hyper_util::server::conn::auto::Builder`, which
+//! automatically negotiates HTTP/2 or HTTP/1.1 based on the ALPN extension
+//! during the TLS handshake (or defaults to HTTP/1.1 for plain connections).
+//!
 //! ## Graceful shutdown
 //! The accept loop passes a [`watch::Receiver<bool>`] that becomes `true` when
 //! a shutdown signal is received.  `handle_connection` detects this inside its
-//! `select!` loop and calls [`hyper::server::conn::http1::Connection::graceful_shutdown`],
-//! which sends `Connection: close` on the next response so the client knows not
-//! to reuse the connection.  The loop then runs to completion.
+//! `select!` loop and calls `Connection::graceful_shutdown`, which signals the
+//! protocol layer to finish the current exchange and close the connection.
 //!
 //! ## Keep-alive timeout
 //! A [`tokio::time::sleep`] timer is armed when the connection is established.
@@ -33,31 +36,50 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
+use sqlx::SqlitePool;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{watch, Semaphore};
 use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
 
 use crate::config::ServerConfig;
+use crate::db;
 use crate::http::request::HttpRequest;
 use crate::http::response::{HttpResponse, ResponseBuilder};
 use crate::http::router::Router;
-use crate::middleware::{ConcurrencyLimiterLayer, LoggingLayer, RateLimiter, RateLimiterLayer};
+use crate::middleware::{
+    extract_bearer, ConcurrencyLimiterLayer, JwtSecret, LoggingLayer, RateLimiter, RateLimiterLayer,
+};
 use crate::server::task::run_blocking;
 use crate::static_files;
+
+/// Shared application state threaded through every connection.
+///
+/// Bundles together the resources that are created once at server startup and
+/// shared (via `Arc`) across all connection tasks.  Using a single struct keeps
+/// the [`handle_connection`] signature within clippy's argument-count limit.
+#[derive(Clone)]
+pub struct AppState {
+    /// SQLite connection pool.
+    pub db_pool: Arc<SqlitePool>,
+    /// JWT signing / verification keys.
+    pub jwt: Arc<JwtSecret>,
+}
 
 /// Drive a single accepted connection to completion.
 ///
 /// Generic over `S` so the same logic handles both plain [`tokio::net::TcpStream`]
 /// and TLS-wrapped streams (`tokio_rustls::server::TlsStream<TcpStream>`).
 ///
-/// Builds the Tower middleware stack and drives the Hyper HTTP/1.1 connection
-/// state machine.  The [`watch::Receiver`] is used to signal graceful shutdown
-/// across all active connections simultaneously.
+/// Builds the Tower middleware stack and drives the Hyper HTTP/1.1 or HTTP/2
+/// connection state machine.  Protocol selection is automatic via
+/// `auto::Builder` (ALPN for TLS; HTTP/1.1 for plain connections).
+/// The [`watch::Receiver`] is used to signal graceful shutdown across all
+/// active connections simultaneously.
 pub async fn handle_connection<S>(
     stream: S,
     peer_addr: SocketAddr,
@@ -65,6 +87,7 @@ pub async fn handle_connection<S>(
     rate_limiter: Arc<RateLimiter>,
     concurrency_limiter: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
+    state: AppState,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -72,7 +95,11 @@ pub async fn handle_connection<S>(
 
     // Build the router once per connection; all keep-alive requests on this
     // connection share the same Arc<Router>.
-    let router = Arc::new(build_router(&config));
+    let router = Arc::new(build_router(
+        &config,
+        Arc::clone(&state.db_pool),
+        Arc::clone(&state.jwt),
+    ));
     let max_body = config.max_body_bytes;
 
     // ── Inner service: body collection + dispatch ──────────────────────────
@@ -135,9 +162,11 @@ pub async fn handle_connection<S>(
     let io = TokioIo::new(stream);
 
     // ── Drive connection with keep-alive timeout + graceful shutdown ───────
-    let conn = http1::Builder::new()
-        .keep_alive(true)
-        .serve_connection(io, service);
+    // `auto::Builder` handles HTTP/1.1 and HTTP/2 transparently: for TLS
+    // connections it reads the ALPN extension negotiated during handshake; for
+    // plain TCP it defaults to HTTP/1.1.
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let conn = builder.serve_connection(io, service);
     tokio::pin!(conn);
 
     // Keep-alive idle timeout: drop the connection if it sits idle for too long.
@@ -155,10 +184,20 @@ pub async fn handle_connection<S>(
             result = &mut conn => {
                 match result {
                     Ok(()) => debug!(peer = %peer_addr, "Connection closed cleanly"),
-                    Err(e) if e.is_incomplete_message() => {
-                        debug!(peer = %peer_addr, "Client disconnected mid-request")
+                    Err(e) => {
+                        // auto::Builder's error type is Box<dyn Error>; downcast
+                        // to hyper::Error to check for the benign "incomplete
+                        // message" case (client closed mid-request).
+                        let incomplete = e
+                            .downcast_ref::<hyper::Error>()
+                            .map(|he| he.is_incomplete_message())
+                            .unwrap_or(false);
+                        if incomplete {
+                            debug!(peer = %peer_addr, "Client disconnected mid-request");
+                        } else {
+                            error!(peer = %peer_addr, err = %e, "HTTP connection error");
+                        }
                     }
-                    Err(e) => error!(peer = %peer_addr, err = %e, "HTTP connection error"),
                 }
                 break;
             }
@@ -185,11 +224,12 @@ pub async fn handle_connection<S>(
 
 /// Build the application router.
 ///
-/// Called once per accepted connection.  Add routes here as new endpoints are
-/// developed.  The router is wrapped in an `Arc` by `handle_connection` so it
-/// is shared across all keep-alive requests on the same connection without
-/// cloning.
-pub(crate) fn build_router(cfg: &ServerConfig) -> Router {
+/// Called once per accepted connection.  The router is wrapped in an `Arc` by
+/// `handle_connection` so it is shared across all keep-alive requests on the
+/// same connection without cloning.
+///
+/// `db` and `jwt` are shared via `Arc` clones captured in route closures.
+pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<JwtSecret>) -> Router {
     let mut router = Router::new();
 
     router.get("/", |_req| async {
@@ -207,11 +247,6 @@ pub(crate) fn build_router(cfg: &ServerConfig) -> Router {
     });
 
     // CPU-bound demo route added in Phase 3.
-    //
-    // Computes the n-th Fibonacci number on the blocking thread pool so the
-    // async workers stay free.  Caps `n` at 50 to prevent runaway computation
-    // (fib(50) already takes ~100 ms with the naive recursive algorithm, which
-    // is enough to demonstrate the blocking pool without overloading tests).
     router.get("/fib/:n", |req| async move {
         let n: u64 = req
             .path_param("n")
@@ -229,15 +264,160 @@ pub(crate) fn build_router(cfg: &ServerConfig) -> Router {
     });
 
     // Static file serving added in Phase 4.
-    //
-    // Files are served from `config.static_dir` relative to the server's
-    // working directory.  Path traversal attacks are blocked in `serve_file`.
     let static_dir = PathBuf::from(&cfg.static_dir);
     router.get("/static/*filepath", move |req| {
         let base = static_dir.clone();
         async move {
             let filepath = req.path_param("filepath").unwrap_or("").to_string();
             static_files::serve_file(&base, &filepath).await
+        }
+    });
+
+    // ── Phase 8: JWT authentication + SQLite CRUD routes ──────────────────
+
+    // POST /auth/token — issue a JWT for valid credentials.
+    //
+    // Accepts: `{"username": "...", "password": "..."}`
+    // Returns: `{"token": "..."}`  or 401 on bad credentials.
+    //
+    // Note: credentials are hard-coded here.  In production these would be
+    // checked against a hashed password stored in the database.
+    let jwt_for_token = Arc::clone(&jwt);
+    router.post("/auth/token", move |req| {
+        let jwt = Arc::clone(&jwt_for_token);
+        async move {
+            #[derive(serde::Deserialize)]
+            struct LoginPayload {
+                username: String,
+                password: String,
+            }
+            let payload: LoginPayload = match serde_json::from_slice(&req.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ResponseBuilder::new(StatusCode::BAD_REQUEST)
+                        .json(&serde_json::json!({"error": "invalid JSON body"}))
+                }
+            };
+            // Hard-coded credentials for demonstration purposes.
+            if payload.username != "admin" || payload.password != "secret" {
+                return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                    .json(&serde_json::json!({"error": "invalid credentials"}));
+            }
+            match jwt.create_token(&payload.username) {
+                Ok(token) => ResponseBuilder::ok().json(&serde_json::json!({"token": token})),
+                Err(e) => {
+                    error!(err = %e, "Failed to create JWT");
+                    ResponseBuilder::internal_error().empty()
+                }
+            }
+        }
+    });
+
+    // GET /api/items — list all items (public).
+    let db_list = Arc::clone(&db);
+    router.get("/api/items", move |_req| {
+        let pool = Arc::clone(&db_list);
+        async move {
+            match db::list_items(&pool).await {
+                Ok(items) => ResponseBuilder::ok().json(&serde_json::json!(items)),
+                Err(e) => {
+                    error!(err = %e, "list_items failed");
+                    ResponseBuilder::internal_error().empty()
+                }
+            }
+        }
+    });
+
+    // GET /api/items/:id — fetch a single item by ID (public).
+    let db_get = Arc::clone(&db);
+    router.get("/api/items/:id", move |req| {
+        let pool = Arc::clone(&db_get);
+        async move {
+            let id = req.path_param("id").unwrap_or("").to_string();
+            match db::get_item(&pool, &id).await {
+                Ok(Some(item)) => ResponseBuilder::ok().json(&serde_json::json!(item)),
+                Ok(None) => ResponseBuilder::new(StatusCode::NOT_FOUND)
+                    .json(&serde_json::json!({"error": "item not found"})),
+                Err(e) => {
+                    error!(err = %e, "get_item failed");
+                    ResponseBuilder::internal_error().empty()
+                }
+            }
+        }
+    });
+
+    // POST /api/admin/items — create an item (requires valid JWT).
+    let db_create = Arc::clone(&db);
+    let jwt_create = Arc::clone(&jwt);
+    router.post("/api/admin/items", move |req| {
+        let pool = Arc::clone(&db_create);
+        let jwt = Arc::clone(&jwt_create);
+        async move {
+            // Validate JWT.
+            let auth_header = req.header("authorization").map(str::to_owned);
+            let token = match extract_bearer(auth_header.as_deref()) {
+                Some(t) => t.to_owned(),
+                None => {
+                    return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                        .json(&serde_json::json!({"error": "missing Bearer token"}))
+                }
+            };
+            if let Err(e) = jwt.verify_token(&token) {
+                debug!(err = %e, "JWT verification failed");
+                return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                    .json(&serde_json::json!({"error": "invalid or expired token"}));
+            }
+            // Parse body.
+            let payload: db::CreateItem = match serde_json::from_slice(&req.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ResponseBuilder::new(StatusCode::BAD_REQUEST)
+                        .json(&serde_json::json!({"error": "invalid JSON body"}))
+                }
+            };
+            match db::create_item(&pool, &payload.name, &payload.description).await {
+                Ok(item) => {
+                    ResponseBuilder::new(StatusCode::CREATED).json(&serde_json::json!(item))
+                }
+                Err(e) => {
+                    error!(err = %e, "create_item failed");
+                    ResponseBuilder::internal_error().empty()
+                }
+            }
+        }
+    });
+
+    // DELETE /api/admin/items/:id — delete an item (requires valid JWT).
+    let db_delete = Arc::clone(&db);
+    let jwt_delete = Arc::clone(&jwt);
+    router.delete("/api/admin/items/:id", move |req| {
+        let pool = Arc::clone(&db_delete);
+        let jwt = Arc::clone(&jwt_delete);
+        async move {
+            // Validate JWT.
+            let auth_header = req.header("authorization").map(str::to_owned);
+            let token = match extract_bearer(auth_header.as_deref()) {
+                Some(t) => t.to_owned(),
+                None => {
+                    return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                        .json(&serde_json::json!({"error": "missing Bearer token"}))
+                }
+            };
+            if let Err(e) = jwt.verify_token(&token) {
+                debug!(err = %e, "JWT verification failed");
+                return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                    .json(&serde_json::json!({"error": "invalid or expired token"}));
+            }
+            let id = req.path_param("id").unwrap_or("").to_string();
+            match db::delete_item(&pool, &id).await {
+                Ok(true) => ResponseBuilder::ok().json(&serde_json::json!({"deleted": true})),
+                Ok(false) => ResponseBuilder::new(StatusCode::NOT_FOUND)
+                    .json(&serde_json::json!({"error": "item not found"})),
+                Err(e) => {
+                    error!(err = %e, "delete_item failed");
+                    ResponseBuilder::internal_error().empty()
+                }
+            }
         }
     });
 
@@ -281,7 +461,17 @@ mod tests {
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,
             shutdown_drain_secs: 30,
+            db_url: "sqlite::memory:".to_string(),
+            jwt_secret: "test-secret".to_string(),
         })
+    }
+
+    async fn test_db() -> Arc<SqlitePool> {
+        Arc::new(crate::db::init_pool("sqlite::memory:").await.unwrap())
+    }
+
+    fn test_jwt() -> Arc<JwtSecret> {
+        Arc::new(JwtSecret::new("test-secret"))
     }
 
     fn make_req(method: Method, uri: &str) -> HttpRequest {
@@ -302,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn health_route_returns_ok() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "ok\n");
@@ -311,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn root_route_returns_server_name() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_str(resp).await.contains("rust-highperf-server"));
@@ -320,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn echo_path_param_returned() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/echo/world")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "world\n");
@@ -329,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_returns_404() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/not-a-route")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -345,7 +535,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_returns_correct_value() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/fib/10")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "55\n");
@@ -354,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_caps_at_50() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         // n=999 should be capped to 50 → fib(50) = 12586269025
         let resp = router.dispatch(make_req(Method::GET, "/fib/999")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -364,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn response_has_server_header() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(
             resp.headers().get("server").unwrap(),
@@ -375,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn static_route_returns_404_for_missing_file() {
         let cfg = test_config();
-        let router = build_router(&cfg);
+        let router = build_router(&cfg, test_db().await, test_jwt());
         let resp = router
             .dispatch(make_req(Method::GET, "/static/nonexistent.txt"))
             .await;

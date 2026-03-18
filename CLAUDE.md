@@ -28,7 +28,7 @@ src/
 ├── lib.rs               # Crate root: re-exports public modules
 ├── server/
 │   ├── mod.rs           # Server struct, TCP listener, connection accept loop
-│   └── connection.rs    # Per-connection handling, task spawning
+│   └── connection.rs    # Per-connection handling, AppState, build_router
 ├── http/
 │   ├── mod.rs           # Re-exports request/response types
 │   ├── request.rs       # HTTP request parsing (zero-copy with httparse)
@@ -36,28 +36,57 @@ src/
 │   └── router.rs        # Route matching and handler dispatch
 ├── middleware/
 │   ├── mod.rs           # Middleware stack composition
+│   ├── auth.rs          # JWT auth: JwtSecret, Claims, extract_bearer
 │   ├── logging.rs       # Structured request/response logging via tracing
+│   ├── concurrency.rs   # ConcurrencyLimiterLayer (global 503 backpressure)
 │   └── rate_limiter.rs  # Token-bucket rate limiter (per-IP)
+├── db/
+│   ├── mod.rs           # Re-exports pool + models
+│   ├── pool.rs          # SQLite pool init, schema migration
+│   └── models.rs        # Item struct, CRUD helpers (sqlx)
+├── tls/
+│   ├── mod.rs           # Re-exports TLS helpers
+│   └── acceptor.rs      # TlsAcceptor from PEM cert+key, ALPN (h2, http/1.1)
 └── static_files/
     ├── mod.rs           # Static file serving with async I/O
     └── mime.rs          # MIME type detection
 ```
 
+## Environment Variables (Phase 8 additions)
+| Variable       | Default                   | Description                        |
+|----------------|---------------------------|------------------------------------|
+| `DATABASE_URL` | `sqlite:./data.db`        | SQLite database path               |
+| `JWT_SECRET`   | `change-me-in-production` | JWT HMAC-SHA256 signing secret     |
+
+## API Routes (Phase 8)
+| Method | Path                    | Auth     | Description                    |
+|--------|-------------------------|----------|--------------------------------|
+| POST   | `/auth/token`           | None     | Issue JWT for valid credentials|
+| GET    | `/api/items`            | None     | List all items                 |
+| GET    | `/api/items/:id`        | None     | Get single item by ID          |
+| POST   | `/api/admin/items`      | Bearer   | Create a new item (201)        |
+| DELETE | `/api/admin/items/:id`  | Bearer   | Delete an item                 |
+
+Default credentials: `{"username": "admin", "password": "secret"}` (override in production).
+
 ## Project Context
 Building a production-ready, high-performance HTTP/HTTPS server targeting 50k+ req/sec. Performance and memory safety are top priorities. Key design decisions:
 - Tokio multi-threaded runtime (worker threads = CPU cores)
-- Hyper for HTTP/1.1 protocol handling
+- Hyper for HTTP/1.1 + HTTP/2 protocol handling (`auto::Builder` with ALPN)
 - Tower Service trait for composable middleware
 - Zero-copy parsing where possible (httparse, Bytes)
 - Token-bucket rate limiting per client IP
 - Async file I/O with streaming (no full-file buffering)
-- **TLS strategy:** HTTP for all development phases and benchmarking (TLS overhead would skew perf numbers). HTTPS via `rustls` + `hyper-rustls` added in Phase 7 — pure Rust, no OpenSSL dependency, production-grade.
+- **TLS strategy:** HTTPS via `rustls` (pure Rust, no OpenSSL). ALPN advertises `h2` + `http/1.1` so HTTP/2 is negotiated automatically over TLS.
+- **Auth strategy:** Stateless JWT (HMAC-SHA256) via `jsonwebtoken`. `JwtSecret` created at startup and shared via `Arc<AppState>`.
+- **Database strategy:** SQLite via `sqlx` (async, compile-time-free queries). Pool created once at startup; schema is migrated idempotently on every start.
 
 ## Phases
-1. **Foundation & Networking** — Tokio runtime, TCP listener, connection management
-2. **HTTP Parser** — Request/response structs, zero-copy parsing, state machine
-3. **Thread Pool & Async Executor** — Task distribution, blocking pool, spawn_blocking
-4. **Middleware & Features** — Static files, structured logging, rate limiting
-5. **Optimization** — Memory pooling (Bytes), keep-alive, backpressure
-6. **Testing & Benchmarking** — Unit tests, integration tests, wrk/hey load testing
-7. **HTTPS / TLS** — `rustls` + `hyper-rustls`, self-signed certs for dev, Let's Encrypt / cert loading for production, HTTP→HTTPS redirect
+1. **Foundation & Networking** — Tokio runtime, TCP listener, connection management ✓
+2. **HTTP Parser** — Request/response structs, zero-copy parsing, state machine ✓
+3. **Thread Pool & Async Executor** — Task distribution, blocking pool, spawn_blocking ✓
+4. **Middleware & Features** — Static files, structured logging, rate limiting ✓
+5. **Optimization** — Memory pooling (Bytes), keep-alive, backpressure ✓
+6. **Testing & Benchmarking** — Unit tests, integration tests, wrk/hey load testing ✓
+7. **HTTPS / TLS** — `rustls`, self-signed certs for dev, HTTP→HTTPS redirect ✓
+8. **HTTP/2 + JWT Auth + SQLite CRUD** — `auto::Builder`, JWT middleware, sqlx CRUD API ✓

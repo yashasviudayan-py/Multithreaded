@@ -68,11 +68,15 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor,
     // Use ring explicitly via builder_with_provider so the choice is
     // deterministic regardless of which CryptoProvider other crates
     // (e.g. reqwest's hyper-rustls) pull into the binary.
-    let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(TlsError::InvalidCertKey)?
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+
+    // Advertise HTTP/2 (h2) and HTTP/1.1 via ALPN so clients can negotiate
+    // the appropriate protocol during the TLS handshake.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
