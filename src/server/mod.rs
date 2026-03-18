@@ -374,10 +374,17 @@ async fn serve_redirect_connection(
 
         // Strip any existing port suffix from the Host header so we can
         // substitute the HTTPS port cleanly.
-        let bare_host = if let Some(pos) = host.rfind(':') {
-            &host[..pos]
+        //
+        // IPv6 literals look like `[::1]` or `[::1]:8080`.  We must NOT use
+        // rfind(':') on them because that finds the colon inside the brackets.
+        // Instead, locate the closing ']' and keep everything up to and
+        // including it; the rest (if any) is the optional ":port" suffix.
+        let bare_host = if host.starts_with('[') {
+            // IPv6 literal: keep "[::1]" and drop any trailing ":port".
+            host.find(']').map(|i| &host[..=i]).unwrap_or(host)
         } else {
-            host
+            // Plain hostname or IPv4: strip the last ":port" if present.
+            host.rfind(':').map(|i| &host[..i]).unwrap_or(host)
         };
 
         let path_and_query = req

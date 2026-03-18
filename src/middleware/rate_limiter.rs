@@ -142,9 +142,15 @@ impl RateLimiter {
     /// [`EVICT_EVERY_N_CHECKS`] requests.  Uses [`DashMap::retain`] which
     /// holds individual shard locks — not a stop-the-world operation.
     fn evict_stale(&self) {
-        let cutoff = Instant::now()
-            .checked_sub(STALE_BUCKET_TTL)
-            .unwrap_or_else(Instant::now);
+        // If the server (or system) has been running for less than STALE_BUCKET_TTL,
+        // no bucket can possibly be stale yet — skip the sweep entirely.
+        // The previous code fell back to `Instant::now()` as the cutoff, which
+        // made every bucket appear stale and caused a full eviction on the very
+        // first sweep during early uptime.
+        let cutoff = match Instant::now().checked_sub(STALE_BUCKET_TTL) {
+            Some(t) => t,
+            None => return,
+        };
         let before = self.buckets.len();
         self.buckets
             .retain(|_, bucket| bucket.last_refill >= cutoff);

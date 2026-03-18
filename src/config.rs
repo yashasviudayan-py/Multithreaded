@@ -196,6 +196,12 @@ impl ServerConfig {
         let shutdown_drain_secs: u64 = drain_str.parse().map_err(|_| {
             ConfigError::InvalidValue("SHUTDOWN_DRAIN_SECS".into(), drain_str.clone())
         })?;
+        if shutdown_drain_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "SHUTDOWN_DRAIN_SECS".into(),
+                "must be > 0".into(),
+            ));
+        }
 
         let http_redirect_port = match env::var("HTTP_REDIRECT_PORT") {
             Ok(v) => {
@@ -331,6 +337,15 @@ mod tests {
         env::set_var("MAX_CONCURRENT_REQUESTS", "0");
         let result = ServerConfig::from_env();
         env::remove_var("MAX_CONCURRENT_REQUESTS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_shutdown_drain_secs_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("SHUTDOWN_DRAIN_SECS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("SHUTDOWN_DRAIN_SECS");
         assert!(result.is_err());
     }
 }
