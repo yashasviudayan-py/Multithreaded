@@ -27,10 +27,17 @@ pub struct ServerConfig {
     pub rate_limit_rps: u32,
     /// Max concurrent connections before backpressure kicks in.
     pub max_connections: usize,
-    /// Path to TLS certificate file. Phase 7: HTTPS.
+    /// Path to TLS certificate file (PEM). Phase 7: HTTPS.
     pub tls_cert_path: Option<String>,
-    /// Path to TLS private key file. Phase 7: HTTPS.
+    /// Path to TLS private key file (PEM). Phase 7: HTTPS.
     pub tls_key_path: Option<String>,
+    /// Port for the plain-HTTP → HTTPS redirect listener.
+    ///
+    /// When set (and TLS is configured), the server binds a second listener on
+    /// this port that responds to every request with a `308 Permanent Redirect`
+    /// pointing to the `https://` equivalent URL.  Typically set to `80` in
+    /// production so that `http://` clients are automatically upgraded.
+    pub http_redirect_port: Option<u16>,
     /// Maximum allowed request body size in bytes.
     ///
     /// Requests exceeding this limit receive a `413 Payload Too Large` response.
@@ -80,6 +87,7 @@ impl ServerConfig {
     /// | `MAX_CONNECTIONS`   | `10000`       | Max concurrent connections               |
     /// | `TLS_CERT_PATH`          | —             | TLS cert path (Phase 7)                  |
     /// | `TLS_KEY_PATH`           | —             | TLS key path (Phase 7)                   |
+    /// | `HTTP_REDIRECT_PORT`     | —             | HTTP→HTTPS redirect port (Phase 7)       |
     /// | `MAX_BODY_BYTES`         | `4194304`     | Max request body size (bytes)            |
     /// | `KEEP_ALIVE_TIMEOUT`     | `75`          | Idle keep-alive timeout (seconds)        |
     /// | `MAX_CONCURRENT_REQUESTS`| `5000`        | Max in-flight requests server-wide       |
@@ -189,6 +197,16 @@ impl ServerConfig {
             ConfigError::InvalidValue("SHUTDOWN_DRAIN_SECS".into(), drain_str.clone())
         })?;
 
+        let http_redirect_port = match env::var("HTTP_REDIRECT_PORT") {
+            Ok(v) => {
+                let p: u16 = v.parse().map_err(|_| {
+                    ConfigError::InvalidValue("HTTP_REDIRECT_PORT".into(), v.clone())
+                })?;
+                Some(p)
+            }
+            Err(_) => None,
+        };
+
         Ok(Self {
             addr,
             workers,
@@ -199,6 +217,7 @@ impl ServerConfig {
             max_connections,
             tls_cert_path: env::var("TLS_CERT_PATH").ok(),
             tls_key_path: env::var("TLS_KEY_PATH").ok(),
+            http_redirect_port,
             max_body_bytes,
             keep_alive_timeout_secs,
             max_concurrent_requests,

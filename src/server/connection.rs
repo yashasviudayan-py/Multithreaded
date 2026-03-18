@@ -37,7 +37,7 @@ use hyper::server::conn::http1;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{watch, Semaphore};
 use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
@@ -50,19 +50,24 @@ use crate::middleware::{ConcurrencyLimiterLayer, LoggingLayer, RateLimiter, Rate
 use crate::server::task::run_blocking;
 use crate::static_files;
 
-/// Drive a single accepted TCP connection to completion.
+/// Drive a single accepted connection to completion.
+///
+/// Generic over `S` so the same logic handles both plain [`tokio::net::TcpStream`]
+/// and TLS-wrapped streams (`tokio_rustls::server::TlsStream<TcpStream>`).
 ///
 /// Builds the Tower middleware stack and drives the Hyper HTTP/1.1 connection
 /// state machine.  The [`watch::Receiver`] is used to signal graceful shutdown
 /// across all active connections simultaneously.
-pub async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S>(
+    stream: S,
     peer_addr: SocketAddr,
     config: Arc<ServerConfig>,
     rate_limiter: Arc<RateLimiter>,
     concurrency_limiter: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     debug!(peer = %peer_addr, "Connection accepted");
 
     // Build the router once per connection; all keep-alive requests on this
@@ -271,6 +276,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            http_redirect_port: None,
             max_body_bytes: 4_194_304,
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,

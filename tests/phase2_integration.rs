@@ -40,6 +40,7 @@ where
         max_connections: 64,
         tls_cert_path: None,
         tls_key_path: None,
+        http_redirect_port: None,
         max_body_bytes: 4_194_304,
         keep_alive_timeout_secs: 75,
         max_concurrent_requests: 5000,

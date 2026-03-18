@@ -1,22 +1,41 @@
 //! Server module: TCP listener, connection accept loop, and graceful shutdown.
+//!
+//! ## TLS support (Phase 7)
+//! When `config.tls_cert_path` and `config.tls_key_path` are set the server
+//! performs a TLS handshake on each accepted TCP connection before passing it
+//! to [`connection::handle_connection`].  Plain HTTP and HTTPS share identical
+//! middleware stacks and router logic.
+//!
+//! An optional HTTP→HTTPS redirect listener is spawned when
+//! `config.http_redirect_port` is set; it returns `308 Permanent Redirect` for
+//! every request so HTTP clients are seamlessly upgraded.
 
 pub mod connection;
 pub mod task;
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::Empty;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::{watch, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfig;
 use crate::middleware::RateLimiter;
 use crate::server::connection::handle_connection;
+use crate::tls::{load_tls_acceptor, TlsError};
 
 /// Errors that can occur while binding or running the server.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +48,9 @@ pub enum ServerError {
     },
     #[error("Accept loop I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// TLS certificate/key loading failed at startup.
+    #[error("TLS configuration error: {0}")]
+    Tls(#[from] TlsError),
 }
 
 /// The HTTP server: owns configuration and orchestrates accept/shutdown.
@@ -100,7 +122,28 @@ impl Server {
     ) -> Result<(), ServerError> {
         let addr = listener.local_addr()?;
 
-        info!(addr = %addr, max_connections = self.config.max_connections, "Listening for connections");
+        // ── TLS setup ─────────────────────────────────────────────────────────
+        // Load the TLS acceptor once at startup if cert+key paths are provided.
+        // This surfaces cert/key errors before accepting any connections.
+        let tls_acceptor = match (&self.config.tls_cert_path, &self.config.tls_key_path) {
+            (Some(cert), Some(key)) => {
+                let acceptor = load_tls_acceptor(cert, key)?;
+                info!(addr = %addr, cert = %cert, "TLS enabled");
+                Some(acceptor)
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                warn!("TLS_CERT_PATH and TLS_KEY_PATH must both be set to enable HTTPS; falling back to plain HTTP");
+                None
+            }
+            (None, None) => None,
+        };
+
+        info!(
+            addr = %addr,
+            max_connections = self.config.max_connections,
+            tls = tls_acceptor.is_some(),
+            "Listening for connections"
+        );
 
         // Notify tests (or any orchestrator) that we are ready to accept.
         if let Some(tx) = ready_tx {
@@ -134,6 +177,18 @@ impl Server {
         // where a connection exists but is not counted.
         let in_flight = Arc::new(AtomicUsize::new(0));
         let all_drained = Arc::new(tokio::sync::Notify::new());
+
+        // ── HTTP→HTTPS redirect server ────────────────────────────────────────
+        // When TLS is active and an HTTP redirect port is configured, spawn a
+        // lightweight listener that issues 308 redirects to the https:// URL.
+        if tls_acceptor.is_some() {
+            if let Some(redirect_port) = config.http_redirect_port {
+                let redirect_addr = SocketAddr::new(addr.ip(), redirect_port);
+                let https_port = addr.port();
+                let rx = shutdown_rx.clone();
+                tokio::spawn(run_http_redirect(redirect_addr, https_port, rx));
+            }
+        }
 
         // Pin the shutdown future so we can poll it across loop iterations
         // without re-registering OS signal handlers each time.
@@ -171,16 +226,34 @@ impl Server {
                                     let counter = Arc::clone(&in_flight);
                                     let notify = Arc::clone(&all_drained);
 
-                                    tokio::spawn(async move {
-                                        // Permit is released when the task exits,
-                                        // even on panic (Drop is always called).
-                                        let _permit = permit;
-                                        handle_connection(stream, peer_addr, cfg, rl, cl, rx).await;
-                                        // Decrement; if we were the last one, wake the drain waiter.
-                                        if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                            notify.notify_one();
-                                        }
-                                    });
+                                    if let Some(ref acceptor) = tls_acceptor {
+                                        // TLS path: perform the handshake in the spawned task
+                                        // so the accept loop is not blocked waiting for a slow client.
+                                        let acceptor = acceptor.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            match acceptor.accept(stream).await {
+                                                Ok(tls_stream) => {
+                                                    handle_connection(tls_stream, peer_addr, cfg, rl, cl, rx).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(peer = %peer_addr, err = %e, "TLS handshake failed");
+                                                }
+                                            }
+                                            if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                                notify.notify_one();
+                                            }
+                                        });
+                                    } else {
+                                        // Plain HTTP path — same as before Phase 7.
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            handle_connection(stream, peer_addr, cfg, rl, cl, rx).await;
+                                            if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                                notify.notify_one();
+                                            }
+                                        });
+                                    }
                                 }
                                 Err(_) => {
                                     // Stream drops here → kernel sends TCP FIN.
@@ -232,6 +305,115 @@ impl Server {
         Ok(())
     }
 }
+
+// ── HTTP → HTTPS redirect server ──────────────────────────────────────────────
+
+/// Bind a plain-HTTP listener and return `308 Permanent Redirect` for every
+/// request, upgrading clients to `https://`.
+///
+/// Runs until `shutdown_rx` signals `true`.  Errors binding the listener are
+/// logged but do not propagate — the HTTPS listener is unaffected.
+async fn run_http_redirect(
+    redirect_addr: SocketAddr,
+    https_port: u16,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let listener = match TcpListener::bind(redirect_addr).await {
+        Ok(l) => {
+            info!(
+                addr = %redirect_addr,
+                https_port = https_port,
+                "HTTP→HTTPS redirect server listening"
+            );
+            l
+        }
+        Err(e) => {
+            error!(addr = %redirect_addr, err = %e, "Failed to bind HTTP redirect listener");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("HTTP redirect server shutting down");
+                    break;
+                }
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, peer_addr)) => {
+                        tokio::spawn(serve_redirect_connection(stream, peer_addr, https_port));
+                    }
+                    Err(e) => {
+                        error!(err = %e, "HTTP redirect accept error");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drive a single HTTP connection, returning a `308 Permanent Redirect` for
+/// every request it makes.
+async fn serve_redirect_connection(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    https_port: u16,
+) {
+    let io = TokioIo::new(stream);
+    let service = tower::service_fn(move |req: Request<Incoming>| async move {
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost");
+
+        // Strip any existing port suffix from the Host header so we can
+        // substitute the HTTPS port cleanly.
+        let bare_host = if let Some(pos) = host.rfind(':') {
+            &host[..pos]
+        } else {
+            host
+        };
+
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        let location = if https_port == 443 {
+            format!("https://{bare_host}{path_and_query}")
+        } else {
+            format!("https://{bare_host}:{https_port}{path_and_query}")
+        };
+
+        Ok::<_, Infallible>(
+            hyper::Response::builder()
+                .status(308)
+                .header("Location", &location)
+                .header("Content-Length", "0")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+    });
+
+    let service = TowerToHyperService::new(service);
+
+    if let Err(e) = http1::Builder::new()
+        .keep_alive(false)
+        .serve_connection(io, service)
+        .await
+    {
+        debug!(peer = %peer_addr, err = %e, "HTTP redirect connection error");
+    }
+}
+
+// ── OS signal helper ───────────────────────────────────────────────────────────
 
 /// Resolves on the first of `SIGINT` (`Ctrl-C`) or `SIGTERM`.
 ///
@@ -287,6 +469,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            http_redirect_port: None,
             max_body_bytes: 4_194_304,
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,
@@ -313,6 +496,7 @@ mod tests {
             max_connections: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            http_redirect_port: None,
             max_body_bytes: 4_194_304,
             keep_alive_timeout_secs: 75,
             max_concurrent_requests: 5000,

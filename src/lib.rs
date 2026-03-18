@@ -12,5 +12,6 @@ pub mod http;
 pub mod middleware;
 pub mod server;
 pub mod static_files;
+pub mod tls;
 
 pub use server::Server;
