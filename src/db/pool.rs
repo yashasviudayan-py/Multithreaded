@@ -17,13 +17,17 @@ pub enum DbError {
 /// Creates the database file if it does not already exist.  Safe to call on
 /// every server start — the migration is idempotent (`CREATE TABLE IF NOT
 /// EXISTS`).
-pub async fn init_pool(db_url: &str) -> Result<SqlitePool, DbError> {
+///
+/// `pool_size` controls the maximum number of concurrent SQLite connections.
+/// Set via `DB_POOL_SIZE`; the default of 5 is conservative and suitable for
+/// most single-instance workloads.
+pub async fn init_pool(db_url: &str, pool_size: u32) -> Result<SqlitePool, DbError> {
     // `create_if_missing(true)` ensures the SQLite file is created when the
     // URL points to a new path (e.g. on first launch).
     let opts = SqliteConnectOptions::from_str(db_url)?.create_if_missing(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(pool_size)
         .connect_with(opts)
         .await?;
 

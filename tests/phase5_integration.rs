@@ -37,6 +37,9 @@ fn base_cfg(addr: SocketAddr) -> ServerConfig {
         auth_username: "admin".to_string(),
         auth_password: "secret".to_string(),
         request_timeout_secs: 30,
+        db_pool_size: 5,
+        blocked_ips: vec![],
+        allowed_ips: vec![],
     }
 }
 

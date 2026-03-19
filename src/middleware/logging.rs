@@ -21,9 +21,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use hyper::header::HeaderValue;
 use hyper::Request;
 use tower::{Layer, Service};
 use tracing::info;
+use uuid::Uuid;
 
 use crate::http::response::HttpResponse;
 
@@ -74,16 +76,32 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let start = Instant::now();
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
         let peer = self.peer;
 
+        // Extract or generate a request-ID for distributed tracing.
+        // If the client sends `x-request-id`, we echo it back; otherwise
+        // we mint a fresh UUID v4.
+        let request_id = req
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        // Propagate the (possibly generated) ID inbound so handlers can read it.
+        if let Ok(val) = HeaderValue::from_str(&request_id) {
+            req.headers_mut().insert("x-request-id", val);
+        }
+
+        let rid_for_response = request_id.clone();
         let fut = self.inner.call(req);
 
         Box::pin(async move {
-            let result = fut.await;
+            let mut result = fut.await;
             let elapsed_ms = start.elapsed().as_millis();
             let status = match &result {
                 Ok(resp) => resp.status().as_u16(),
@@ -95,8 +113,13 @@ where
                 path = %path,
                 status = status,
                 latency_ms = elapsed_ms,
+                request_id = %request_id,
                 "request"
             );
+            // Echo x-request-id back in the response so clients can correlate.
+            if let Ok(val) = HeaderValue::from_str(&rid_for_response) {
+                result.as_mut().unwrap().headers_mut().insert("x-request-id", val);
+            }
             result
         })
     }
@@ -151,5 +174,33 @@ mod tests {
         let resp = svc.call(make_req(Method::GET, "/health")).await.unwrap();
         // Inner service sets the server header; logging layer must not strip it.
         assert!(resp.headers().get("server").is_some());
+    }
+
+    #[tokio::test]
+    async fn logging_injects_x_request_id_when_missing() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut svc = ServiceBuilder::new()
+            .layer(LoggingLayer::new(peer))
+            .service(echo_service());
+
+        let resp = svc.call(make_req(Method::GET, "/")).await.unwrap();
+        assert!(resp.headers().get("x-request-id").is_some());
+    }
+
+    #[tokio::test]
+    async fn logging_echoes_client_provided_x_request_id() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut svc = ServiceBuilder::new()
+            .layer(LoggingLayer::new(peer))
+            .service(echo_service());
+
+        let mut req = make_req(Method::GET, "/");
+        req.headers_mut()
+            .insert("x-request-id", "my-trace-id-123".parse().unwrap());
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(
+            resp.headers().get("x-request-id").unwrap(),
+            "my-trace-id-123"
+        );
     }
 }

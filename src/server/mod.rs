@@ -170,9 +170,13 @@ impl Server {
         // share the same bucket.
         let rate_limiter = Arc::new(RateLimiter::new(self.config.rate_limit_rps));
 
+        // Background task that evicts stale rate-limiter buckets every 60 s
+        // regardless of request volume (complements the call-count-based sweep).
+        Arc::clone(&rate_limiter).start_eviction_task();
+
         // ── Phase 8: Database pool + JWT secret ───────────────────────────────
         // Initialise SQLite connection pool once at startup and share via Arc.
-        let db_pool = Arc::new(db::init_pool(&self.config.db_url).await?);
+        let db_pool = Arc::new(db::init_pool(&self.config.db_url, self.config.db_pool_size).await?);
         let jwt = Arc::new(JwtSecret::new(&self.config.jwt_secret));
         let app_state = AppState { db_pool, jwt };
 
@@ -219,6 +223,24 @@ impl Server {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            // ── IP filter ───────────────────────────────
+                            // Drop blocked IPs and non-allowlisted IPs at
+                            // the socket level — no HTTP overhead.
+                            if config.is_blocked(peer_addr.ip()) {
+                                warn!(
+                                    peer = %peer_addr,
+                                    "Blocked IP — dropping connection"
+                                );
+                                continue;
+                            }
+                            if !config.is_allowed(peer_addr.ip()) {
+                                warn!(
+                                    peer = %peer_addr,
+                                    "IP not in allowlist — dropping connection"
+                                );
+                                continue;
+                            }
+
                             // Reduce latency for small responses (ACKs sent immediately).
                             if let Err(e) = stream.set_nodelay(true) {
                                 warn!(peer = %peer_addr, err = %e, "Failed to set TCP_NODELAY");
@@ -499,6 +521,9 @@ mod tests {
             auth_username: "admin".to_string(),
             auth_password: "secret".to_string(),
             request_timeout_secs: 30,
+            db_pool_size: 5,
+            blocked_ips: vec![],
+            allowed_ips: vec![],
         }
     }
 
@@ -531,6 +556,9 @@ mod tests {
             auth_username: "admin".to_string(),
             auth_password: "secret".to_string(),
             request_timeout_secs: 30,
+            db_pool_size: 5,
+            blocked_ips: vec![],
+            allowed_ips: vec![],
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

@@ -164,6 +164,28 @@ impl RateLimiter {
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
     }
+
+    /// Spawn a background Tokio task that runs [`evict_stale`] every 60 seconds.
+    ///
+    /// Complements the call-count-based sweep: on low-traffic servers the
+    /// call-count trigger may fire infrequently, letting stale buckets
+    /// accumulate.  The background task guarantees at most 60 s of extra
+    /// memory per idle IP.
+    ///
+    /// The returned [`tokio::task::JoinHandle`] is intentionally dropped by
+    /// the caller (`accept_loop`): the task runs until the process exits.
+    pub fn start_eviction_task(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(60));
+            // The first tick resolves immediately; subsequent ticks are 60 s apart.
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                self.evict_stale();
+            }
+        });
+    }
 }
 
 // ── Tower Layer / Service ─────────────────────────────────────────────────────

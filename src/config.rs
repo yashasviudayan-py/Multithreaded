@@ -86,6 +86,24 @@ pub struct ServerConfig {
     /// returns `503 Service Unavailable` and logs a warning.  Defaults to
     /// 30 s.  Set via `REQUEST_TIMEOUT_SECS`.
     pub request_timeout_secs: u64,
+    /// Maximum number of SQLite connections in the pool.
+    ///
+    /// Set via `DB_POOL_SIZE`; defaults to `5`.  Increase for higher
+    /// database concurrency (at the cost of more file descriptors and
+    /// SQLite write contention).
+    pub db_pool_size: u32,
+    /// Comma-separated list of IP addresses that are blocked outright.
+    ///
+    /// Connections from these IPs are dropped in the accept loop before any
+    /// HTTP processing.  Set via `BLOCKED_IPS` (e.g. `"1.2.3.4,5.6.7.8"`).
+    /// Empty by default (no IPs blocked).
+    pub blocked_ips: Vec<std::net::IpAddr>,
+    /// Comma-separated allowlist of IP addresses.
+    ///
+    /// When non-empty, only IPs in this list are accepted.  All others are
+    /// dropped in the accept loop.  Set via `ALLOWED_IPS`.  Empty by default
+    /// (all IPs allowed).
+    pub allowed_ips: Vec<std::net::IpAddr>,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -265,6 +283,24 @@ impl ServerConfig {
             ));
         }
 
+        let pool_str = env::var("DB_POOL_SIZE").unwrap_or_else(|_| "5".to_string());
+        let db_pool_size: u32 = pool_str
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue("DB_POOL_SIZE".into(), pool_str.clone()))?;
+        if db_pool_size == 0 {
+            return Err(ConfigError::InvalidValue(
+                "DB_POOL_SIZE".into(),
+                "must be > 0".into(),
+            ));
+        }
+
+        let blocked_ips = Self::parse_ip_list(
+            &env::var("BLOCKED_IPS").unwrap_or_default(),
+        );
+        let allowed_ips = Self::parse_ip_list(
+            &env::var("ALLOWED_IPS").unwrap_or_default(),
+        );
+
         Ok(Self {
             addr,
             workers,
@@ -285,7 +321,28 @@ impl ServerConfig {
             auth_username,
             auth_password,
             request_timeout_secs,
+            db_pool_size,
+            blocked_ips,
+            allowed_ips,
         })
+    }
+
+    /// Parse a comma-separated list of IP addresses, silently skipping
+    /// entries that fail to parse.
+    fn parse_ip_list(s: &str) -> Vec<std::net::IpAddr> {
+        s.split(',')
+            .filter_map(|ip| ip.trim().parse().ok())
+            .collect()
+    }
+
+    /// Returns `true` if `ip` is in the explicit block-list.
+    pub fn is_blocked(&self, ip: std::net::IpAddr) -> bool {
+        self.blocked_ips.contains(&ip)
+    }
+
+    /// Returns `true` if `ip` is allowed (allowlist is empty ⇒ all allowed).
+    pub fn is_allowed(&self, ip: std::net::IpAddr) -> bool {
+        self.allowed_ips.is_empty() || self.allowed_ips.contains(&ip)
     }
 }
 
@@ -328,6 +385,9 @@ mod tests {
         assert_eq!(cfg.auth_username, "admin");
         assert_eq!(cfg.auth_password, "secret");
         assert_eq!(cfg.request_timeout_secs, 30);
+        assert_eq!(cfg.db_pool_size, 5);
+        assert!(cfg.blocked_ips.is_empty());
+        assert!(cfg.allowed_ips.is_empty());
     }
 
     #[test]
@@ -418,6 +478,31 @@ mod tests {
         let result = ServerConfig::from_env();
         env::remove_var("REQUEST_TIMEOUT_SECS");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_db_pool_size_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("DB_POOL_SIZE", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("DB_POOL_SIZE");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn blocked_and_allowed_ips_parsed_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("BLOCKED_IPS", "1.2.3.4,5.6.7.8");
+        env::set_var("ALLOWED_IPS", "10.0.0.1");
+        let cfg = ServerConfig::from_env().expect("config should load");
+        env::remove_var("BLOCKED_IPS");
+        env::remove_var("ALLOWED_IPS");
+        assert_eq!(cfg.blocked_ips.len(), 2);
+        assert_eq!(cfg.allowed_ips.len(), 1);
+        assert!(cfg.is_blocked("1.2.3.4".parse().unwrap()));
+        assert!(!cfg.is_blocked("9.9.9.9".parse().unwrap()));
+        assert!(cfg.is_allowed("10.0.0.1".parse().unwrap()));
+        assert!(!cfg.is_allowed("9.9.9.9".parse().unwrap()));
     }
 
     #[test]
