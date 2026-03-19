@@ -184,7 +184,21 @@ impl Server {
         let metrics = Metrics::new();
         let sessions = Arc::new(SessionStore::new());
         let template_engine = TemplateEngine::new("templates");
-        let app_state = AppState { db_pool, jwt, metrics, sessions, template_engine };
+        let proxy_client = self.config.proxy_upstream.as_ref().map(|upstream| {
+            info!(upstream = %upstream, "Reverse-proxy mode enabled");
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(self.config.request_timeout_secs))
+                .build()
+                .expect("failed to build reverse-proxy HTTP client")
+        });
+        let app_state = AppState {
+            db_pool,
+            jwt,
+            metrics,
+            sessions,
+            template_engine,
+            proxy_client,
+        };
 
         let config = Arc::new(self.config);
 
@@ -543,6 +557,8 @@ mod tests {
             db_pool_size: 5,
             blocked_ips: vec![],
             allowed_ips: vec![],
+            proxy_upstream: None,
+            proxy_strip_prefix: None,
         }
     }
 
@@ -578,6 +594,8 @@ mod tests {
             db_pool_size: 5,
             blocked_ips: vec![],
             allowed_ips: vec![],
+            proxy_upstream: None,
+            proxy_strip_prefix: None,
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

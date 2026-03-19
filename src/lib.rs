@@ -12,6 +12,7 @@ pub mod db;
 pub mod http;
 pub mod metrics;
 pub mod middleware;
+pub mod proxy;
 pub mod server;
 pub mod session;
 pub mod static_files;

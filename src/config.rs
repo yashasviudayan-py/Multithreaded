@@ -105,6 +105,16 @@ pub struct ServerConfig {
     /// dropped in the accept loop.  Set via `ALLOWED_IPS`.  Empty by default
     /// (all IPs allowed).
     pub allowed_ips: Vec<std::net::IpAddr>,
+    /// Upstream base URL for reverse-proxy mode.
+    ///
+    /// When set (e.g. `http://backend:3000`), all requests that do not match
+    /// a local route are forwarded to this server.  Set via `PROXY_UPSTREAM`.
+    pub proxy_upstream: Option<String>,
+    /// Path prefix to strip before forwarding to the upstream.
+    ///
+    /// Example: with `PROXY_STRIP_PREFIX=/api`, a request to `/api/users` is
+    /// forwarded to `{upstream}/users`.  Set via `PROXY_STRIP_PREFIX`.
+    pub proxy_strip_prefix: Option<String>,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -267,13 +277,10 @@ impl ServerConfig {
         let jwt_secret =
             env::var("JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
 
-        let auth_username =
-            env::var("AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
-        let auth_password =
-            env::var("AUTH_PASSWORD").unwrap_or_else(|_| "secret".to_string());
+        let auth_username = env::var("AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let auth_password = env::var("AUTH_PASSWORD").unwrap_or_else(|_| "secret".to_string());
 
-        let timeout_str =
-            env::var("REQUEST_TIMEOUT_SECS").unwrap_or_else(|_| "30".to_string());
+        let timeout_str = env::var("REQUEST_TIMEOUT_SECS").unwrap_or_else(|_| "30".to_string());
         let request_timeout_secs: u64 = timeout_str.parse().map_err(|_| {
             ConfigError::InvalidValue("REQUEST_TIMEOUT_SECS".into(), timeout_str.clone())
         })?;
@@ -295,12 +302,11 @@ impl ServerConfig {
             ));
         }
 
-        let blocked_ips = Self::parse_ip_list(
-            &env::var("BLOCKED_IPS").unwrap_or_default(),
-        );
-        let allowed_ips = Self::parse_ip_list(
-            &env::var("ALLOWED_IPS").unwrap_or_default(),
-        );
+        let blocked_ips = Self::parse_ip_list(&env::var("BLOCKED_IPS").unwrap_or_default());
+        let allowed_ips = Self::parse_ip_list(&env::var("ALLOWED_IPS").unwrap_or_default());
+
+        let proxy_upstream = env::var("PROXY_UPSTREAM").ok();
+        let proxy_strip_prefix = env::var("PROXY_STRIP_PREFIX").ok();
 
         Ok(Self {
             addr,
@@ -325,6 +331,8 @@ impl ServerConfig {
             db_pool_size,
             blocked_ips,
             allowed_ips,
+            proxy_upstream,
+            proxy_strip_prefix,
         })
     }
 
@@ -389,6 +397,8 @@ mod tests {
         assert_eq!(cfg.db_pool_size, 5);
         assert!(cfg.blocked_ips.is_empty());
         assert!(cfg.allowed_ips.is_empty());
+        assert!(cfg.proxy_upstream.is_none());
+        assert!(cfg.proxy_strip_prefix.is_none());
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     /// Tera HTML template engine (`None` when `templates/` dir is missing).
     pub template_engine: Option<TemplateEngine>,
+    /// reqwest HTTP client for reverse-proxy mode (`None` when proxy is off).
+    pub proxy_client: Option<reqwest::Client>,
 }
 
 /// Drive a single accepted connection to completion.
@@ -111,6 +113,7 @@ pub async fn handle_connection<S>(
         Arc::clone(&state.metrics),
         Arc::clone(&state.sessions),
         state.template_engine.clone(),
+        state.proxy_client.clone(),
     ));
     let max_body = config.max_body_bytes;
     let request_timeout = config.request_timeout_secs;
@@ -123,8 +126,10 @@ pub async fn handle_connection<S>(
         let router = Arc::clone(&router);
         let m = Arc::clone(&metrics);
         async move {
-            m.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            m.requests_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.requests_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.requests_active
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let (parts, body) = req.into_parts();
 
@@ -178,7 +183,8 @@ pub async fn handle_connection<S>(
                         timeout_secs = request_timeout,
                         "Request processing timed out"
                     );
-                    m.timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.timed_out
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ResponseBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
                         .text("503 Service Unavailable: processing timeout\n")
                 }
@@ -187,13 +193,17 @@ pub async fn handle_connection<S>(
             // Update status-class counters and decrement active gauge.
             let sc = response.status().as_u16();
             if sc < 300 {
-                m.responses_2xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.responses_2xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else if sc < 500 {
-                m.responses_4xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.responses_4xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
-                m.responses_5xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.responses_5xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            m.requests_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            m.requests_active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             Ok::<HttpResponse, Infallible>(response)
         }
@@ -285,6 +295,7 @@ pub(crate) fn build_router(
     metrics: Arc<Metrics>,
     sessions: Arc<SessionStore>,
     tmpl: Option<TemplateEngine>,
+    proxy_client: Option<reqwest::Client>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -504,10 +515,14 @@ pub(crate) fn build_router(
             let engine = e.clone();
             let sessions = Arc::clone(&sess_home);
             async move {
-                let token = req.header("cookie").and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                let token = req
+                    .header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 let session_user = token.as_deref().and_then(|t| sessions.get(t));
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
+                if let Some(ref u) = session_user {
+                    ctx.insert("session_user", u);
+                }
                 engine.render("index.html", &ctx)
             }
         });
@@ -543,15 +558,18 @@ pub(crate) fn build_router(
                         let decoded = percent_encoding::percent_decode_str(&val)
                             .decode_utf8_lossy()
                             .to_string();
-                        if k == "username" { username = decoded.clone(); }
-                        if k == "password" { password = decoded; }
+                        if k == "username" {
+                            username = decoded.clone();
+                        }
+                        if k == "password" {
+                            password = decoded;
+                        }
                     }
                 }
                 if username == expected_user && password == expected_pass {
                     let token = sessions.create(username.clone());
-                    let cookie = format!(
-                        "session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600"
-                    );
+                    let cookie =
+                        format!("session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600");
                     ResponseBuilder::new(hyper::StatusCode::FOUND)
                         .header("location", "/ui/items")
                         .header("set-cookie", &cookie)
@@ -570,7 +588,8 @@ pub(crate) fn build_router(
         router.get("/ui/logout", move |req| {
             let sessions = Arc::clone(&sess_logout);
             async move {
-                let token = req.header("cookie")
+                let token = req
+                    .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 if let Some(t) = token.as_deref() {
                     sessions.remove(t);
@@ -591,12 +610,15 @@ pub(crate) fn build_router(
             let pool = Arc::clone(&db_ui_list);
             let sessions = Arc::clone(&sess_items);
             async move {
-                let token = req.header("cookie")
+                let token = req
+                    .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 let session_user = token.as_deref().and_then(|t| sessions.get(t));
                 let items = db::list_items(&pool).await.unwrap_or_default();
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
+                if let Some(ref u) = session_user {
+                    ctx.insert("session_user", u);
+                }
                 ctx.insert("items", &items);
                 // Pass any flash message from query string.
                 if let Some(msg) = req.query_param("flash") {
@@ -615,7 +637,8 @@ pub(crate) fn build_router(
             let pool = Arc::clone(&db_ui_create);
             let sessions = Arc::clone(&sess_create);
             async move {
-                let token = req.header("cookie")
+                let token = req
+                    .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
                     return ResponseBuilder::new(hyper::StatusCode::FOUND)
@@ -631,8 +654,12 @@ pub(crate) fn build_router(
                         let decoded = percent_encoding::percent_decode_str(&val)
                             .decode_utf8_lossy()
                             .to_string();
-                        if k == "name"        { name = decoded.clone(); }
-                        if k == "description" { description = decoded; }
+                        if k == "name" {
+                            name = decoded.clone();
+                        }
+                        if k == "description" {
+                            description = decoded;
+                        }
                     }
                 }
                 match db::create_item(&pool, &name, &description).await {
@@ -659,7 +686,8 @@ pub(crate) fn build_router(
             let pool = Arc::clone(&db_ui_delete);
             let sessions = Arc::clone(&sess_delete);
             async move {
-                let token = req.header("cookie")
+                let token = req
+                    .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
                     return ResponseBuilder::new(hyper::StatusCode::FOUND)
@@ -690,21 +718,57 @@ pub(crate) fn build_router(
             let m = Arc::clone(&m_ui);
             let sessions = Arc::clone(&sess_metrics);
             async move {
-                let token = req.header("cookie")
+                let token = req
+                    .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
                 let session_user = token.as_deref().and_then(|t| sessions.get(t));
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
-                ctx.insert("requests_total",       &m.requests_total.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("requests_active",      &m.requests_active.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("responses_2xx",        &m.responses_2xx.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("responses_4xx",        &m.responses_4xx.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("responses_5xx",        &m.responses_5xx.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("rate_limited",         &m.rate_limited.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("concurrency_limited",  &m.concurrency_limited.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("timed_out",            &m.timed_out.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("connections_accepted", &m.connections_accepted.load(std::sync::atomic::Ordering::Relaxed));
-                ctx.insert("connections_rejected_ip", &m.connections_rejected_ip.load(std::sync::atomic::Ordering::Relaxed));
+                if let Some(ref u) = session_user {
+                    ctx.insert("session_user", u);
+                }
+                ctx.insert(
+                    "requests_total",
+                    &m.requests_total.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "requests_active",
+                    &m.requests_active.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "responses_2xx",
+                    &m.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "responses_4xx",
+                    &m.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "responses_5xx",
+                    &m.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "rate_limited",
+                    &m.rate_limited.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "concurrency_limited",
+                    &m.concurrency_limited
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "timed_out",
+                    &m.timed_out.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "connections_accepted",
+                    &m.connections_accepted
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                ctx.insert(
+                    "connections_rejected_ip",
+                    &m.connections_rejected_ip
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
                 engine.render("metrics.html", &ctx)
             }
         });
@@ -724,6 +788,21 @@ pub(crate) fn build_router(
                 .text(body)
         }
     });
+
+    // ── Reverse-proxy catch-all route ──────────────────────────────────────
+    // Registered last so all specific local routes above take precedence.
+    // When PROXY_UPSTREAM is set every unmatched request is forwarded to the
+    // configured upstream server.
+    if let (Some(client), Some(upstream)) = (proxy_client, &cfg.proxy_upstream) {
+        let upstream = upstream.clone();
+        let strip = cfg.proxy_strip_prefix.clone();
+        router.any("/*path", move |req| {
+            let client = client.clone();
+            let up = upstream.clone();
+            let sp = strip.clone();
+            async move { crate::proxy::proxy_request(&client, &req, &up, sp.as_deref()).await }
+        });
+    }
 
     router
 }
@@ -773,6 +852,8 @@ mod tests {
             db_pool_size: 5,
             blocked_ips: vec![],
             allowed_ips: vec![],
+            proxy_upstream: None,
+            proxy_strip_prefix: None,
         })
     }
 
@@ -802,7 +883,15 @@ mod tests {
     #[tokio::test]
     async fn health_route_returns_ok() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "ok\n");
@@ -811,7 +900,15 @@ mod tests {
     #[tokio::test]
     async fn root_route_returns_server_name() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_str(resp).await.contains("rust-highperf-server"));
@@ -820,7 +917,15 @@ mod tests {
     #[tokio::test]
     async fn echo_path_param_returned() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/echo/world")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "world\n");
@@ -829,7 +934,15 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_returns_404() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/not-a-route")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -845,7 +958,15 @@ mod tests {
     #[tokio::test]
     async fn fib_route_returns_correct_value() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/fib/10")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "55\n");
@@ -854,7 +975,15 @@ mod tests {
     #[tokio::test]
     async fn fib_route_caps_at_50() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         // n=999 should be capped to 50 → fib(50) = 12586269025
         let resp = router.dispatch(make_req(Method::GET, "/fib/999")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -864,7 +993,15 @@ mod tests {
     #[tokio::test]
     async fn response_has_server_header() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(
             resp.headers().get("server").unwrap(),
@@ -875,7 +1012,15 @@ mod tests {
     #[tokio::test]
     async fn static_route_returns_404_for_missing_file() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
+        let router = build_router(
+            &cfg,
+            test_db().await,
+            test_jwt(),
+            Metrics::new(),
+            Arc::new(SessionStore::new()),
+            None,
+            None,
+        );
         let resp = router
             .dispatch(make_req(Method::GET, "/static/nonexistent.txt"))
             .await;

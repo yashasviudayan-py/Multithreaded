@@ -53,6 +53,8 @@ where
         db_pool_size: 5,
         blocked_ips: vec![],
         allowed_ips: vec![],
+        proxy_upstream: None,
+        proxy_strip_prefix: None,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
