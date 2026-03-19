@@ -60,10 +60,11 @@ pub struct ServerConfig {
     /// waits up to this many seconds for in-flight connections to close before
     /// forcing exit.  Defaults to 30 s.
     pub shutdown_drain_secs: u64,
-    /// SQLite database URL (e.g., `sqlite:./data.db` or `sqlite::memory:`).
+    /// Database URL.  SQLite by default; PostgreSQL with `--features postgres`.
     ///
-    /// Used by Phase 8 to store application data.  Defaults to
-    /// `sqlite:./data.db`.
+    /// - SQLite: `sqlite:./data.db` (default) or `sqlite::memory:`
+    /// - PostgreSQL: `postgres://user:pass@host/dbname`
+    ///   (requires recompiling with `--features postgres`)
     pub db_url: String,
     /// Secret key used to sign and verify JSON Web Tokens (JWT).
     ///

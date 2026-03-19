@@ -10,6 +10,10 @@ default = []
 https = []
 # Phase 4+: Enable Prometheus-compatible metrics endpoint
 metrics = []
+# Phase 9: Enable PostgreSQL backend in addition to SQLite.
+# When enabled, DATABASE_URL must be a postgres:// URL.
+# Compile with: cargo build --features postgres
+postgres = []
 
 [dependencies]
 # Async runtime and networking
@@ -47,6 +51,8 @@ dashmap = "6"
 
 # Phase 8: JWT authentication, SQLite persistence, unique IDs
 jsonwebtoken = "9"
+# SQLite is always compiled in.  Enable the `postgres` Cargo feature to also
+# compile the PostgreSQL backend (requires libpq or a compatible driver).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
 uuid = { version = "1", features = ["v4"] }
 
