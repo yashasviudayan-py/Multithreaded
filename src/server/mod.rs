@@ -34,6 +34,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfig;
 use crate::db;
+use crate::metrics::Metrics;
 use crate::middleware::{JwtSecret, RateLimiter};
 use crate::server::connection::{handle_connection, AppState};
 use crate::tls::{load_tls_acceptor, TlsError};
@@ -178,7 +179,8 @@ impl Server {
         // Initialise SQLite connection pool once at startup and share via Arc.
         let db_pool = Arc::new(db::init_pool(&self.config.db_url, self.config.db_pool_size).await?);
         let jwt = Arc::new(JwtSecret::new(&self.config.jwt_secret));
-        let app_state = AppState { db_pool, jwt };
+        let metrics = Metrics::new();
+        let app_state = AppState { db_pool, jwt, metrics };
 
         let config = Arc::new(self.config);
 
@@ -223,6 +225,11 @@ impl Server {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            app_state.metrics.connections_accepted.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+
                             // ── IP filter ───────────────────────────────
                             // Drop blocked IPs and non-allowlisted IPs at
                             // the socket level — no HTTP overhead.
@@ -231,12 +238,20 @@ impl Server {
                                     peer = %peer_addr,
                                     "Blocked IP — dropping connection"
                                 );
+                                app_state.metrics.connections_rejected_ip.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 continue;
                             }
                             if !config.is_allowed(peer_addr.ip()) {
                                 warn!(
                                     peer = %peer_addr,
                                     "IP not in allowlist — dropping connection"
+                                );
+                                app_state.metrics.connections_rejected_ip.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
                                 );
                                 continue;
                             }

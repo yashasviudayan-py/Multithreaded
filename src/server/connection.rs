@@ -51,6 +51,7 @@ use crate::db;
 use crate::http::request::HttpRequest;
 use crate::http::response::{HttpResponse, ResponseBuilder};
 use crate::http::router::Router;
+use crate::metrics::Metrics;
 use crate::middleware::{
     extract_bearer, ConcurrencyLimiterLayer, JwtSecret, LoggingLayer, RateLimiter, RateLimiterLayer,
 };
@@ -68,6 +69,8 @@ pub struct AppState {
     pub db_pool: Arc<SqlitePool>,
     /// JWT signing / verification keys.
     pub jwt: Arc<JwtSecret>,
+    /// Prometheus-compatible server metrics counters.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Drive a single accepted connection to completion.
@@ -99,16 +102,22 @@ pub async fn handle_connection<S>(
         &config,
         Arc::clone(&state.db_pool),
         Arc::clone(&state.jwt),
+        Arc::clone(&state.metrics),
     ));
     let max_body = config.max_body_bytes;
     let request_timeout = config.request_timeout_secs;
+    let metrics = Arc::clone(&state.metrics);
 
     // ── Inner service: body collection + dispatch ──────────────────────────
     // Use tower::service_fn (not hyper::service::service_fn) so the result
     // implements tower::Service and can be composed with Tower middleware layers.
     let inner = tower::service_fn(move |req: Request<Incoming>| {
         let router = Arc::clone(&router);
+        let m = Arc::clone(&metrics);
         async move {
+            m.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.requests_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             let (parts, body) = req.into_parts();
 
             // Enforce body size limit before collecting.  Check Content-Length
@@ -161,10 +170,23 @@ pub async fn handle_connection<S>(
                         timeout_secs = request_timeout,
                         "Request processing timed out"
                     );
+                    m.timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ResponseBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
                         .text("503 Service Unavailable: processing timeout\n")
                 }
             };
+
+            // Update status-class counters and decrement active gauge.
+            let sc = response.status().as_u16();
+            if sc < 300 {
+                m.responses_2xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if sc < 500 {
+                m.responses_4xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                m.responses_5xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            m.requests_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
             Ok::<HttpResponse, Infallible>(response)
         }
     });
@@ -248,7 +270,12 @@ pub async fn handle_connection<S>(
 /// same connection without cloning.
 ///
 /// `db` and `jwt` are shared via `Arc` clones captured in route closures.
-pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<JwtSecret>) -> Router {
+pub(crate) fn build_router(
+    cfg: &ServerConfig,
+    db: Arc<SqlitePool>,
+    jwt: Arc<JwtSecret>,
+    metrics: Arc<Metrics>,
+) -> Router {
     let mut router = Router::new();
 
     // Auth credentials from config (moved out of hard-coded strings).
@@ -446,6 +473,21 @@ pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<Jwt
         }
     });
 
+    // GET /metrics — Prometheus-compatible metrics endpoint.
+    //
+    // Returns all server counters in the Prometheus text exposition format
+    // (v0.0.4).  No authentication is required; restrict access via the IP
+    // allowlist (ALLOWED_IPS) or a reverse proxy if needed.
+    router.get("/metrics", move |_req| {
+        let m = Arc::clone(&metrics);
+        async move {
+            let body = m.render();
+            ResponseBuilder::ok()
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .text(body)
+        }
+    });
+
     router
 }
 
@@ -523,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn health_route_returns_ok() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "ok\n");
@@ -532,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn root_route_returns_server_name() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_str(resp).await.contains("rust-highperf-server"));
@@ -541,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn echo_path_param_returned() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/echo/world")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "world\n");
@@ -550,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_returns_404() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/not-a-route")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -566,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_returns_correct_value() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/fib/10")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "55\n");
@@ -575,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_caps_at_50() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         // n=999 should be capped to 50 → fib(50) = 12586269025
         let resp = router.dispatch(make_req(Method::GET, "/fib/999")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -585,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn response_has_server_header() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(
             resp.headers().get("server").unwrap(),
@@ -596,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn static_route_returns_404_for_missing_file() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
         let resp = router
             .dispatch(make_req(Method::GET, "/static/nonexistent.txt"))
             .await;
