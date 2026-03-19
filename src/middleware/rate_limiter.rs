@@ -176,8 +176,7 @@ impl RateLimiter {
     /// the caller (`accept_loop`): the task runs until the process exits.
     pub fn start_eviction_task(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             // The first tick resolves immediately; subsequent ticks are 60 s apart.
             interval.tick().await; // skip the immediate first tick
             loop {

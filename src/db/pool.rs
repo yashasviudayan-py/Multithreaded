@@ -105,7 +105,9 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_url_returns_not_enabled_error() {
-        let err = init_pool("postgres://localhost/testdb", 5).await.unwrap_err();
+        let err = init_pool("postgres://localhost/testdb", 5)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::PostgresNotEnabled));
     }
 }

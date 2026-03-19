@@ -62,9 +62,7 @@ impl TemplateEngine {
                 error!(template = template_name, err = %e, "Template render error");
                 ResponseBuilder::internal_error()
                     .header("content-type", "text/html; charset=utf-8")
-                    .text(format!(
-                        "<h1>500 Internal Server Error</h1><pre>{e}</pre>"
-                    ))
+                    .text(format!("<h1>500 Internal Server Error</h1><pre>{e}</pre>"))
             }
         }
     }

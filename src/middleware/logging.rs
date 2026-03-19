@@ -118,7 +118,11 @@ where
             );
             // Echo x-request-id back in the response so clients can correlate.
             if let Ok(val) = HeaderValue::from_str(&rid_for_response) {
-                result.as_mut().unwrap().headers_mut().insert("x-request-id", val);
+                result
+                    .as_mut()
+                    .unwrap()
+                    .headers_mut()
+                    .insert("x-request-id", val);
             }
             result
         })
