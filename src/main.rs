@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use rust_highperf_server::config::ServerConfig;
@@ -23,6 +23,22 @@ fn main() -> Result<()> {
         log_level      = %config.log_level,
         "rust-highperf-server starting up"
     );
+
+    // ── Security warnings for insecure defaults ────────────────────────────
+    if config.jwt_secret == "change-me-in-production" {
+        warn!(
+            "JWT_SECRET is using the insecure default value. \
+             Set a strong random secret via the JWT_SECRET environment variable \
+             before deploying to production."
+        );
+    }
+    if config.auth_username == "admin" && config.auth_password == "secret" {
+        warn!(
+            "AUTH_USERNAME and AUTH_PASSWORD are using default credentials \
+             ('admin'/'secret'). Set AUTH_USERNAME and AUTH_PASSWORD environment \
+             variables before deploying to production."
+        );
+    }
 
     // Build a fully-configured multi-thread runtime instead of relying on the
     // `#[tokio::main]` macro defaults.  This lets us wire in ServerConfig

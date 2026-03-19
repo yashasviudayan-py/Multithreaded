@@ -101,6 +101,7 @@ pub async fn handle_connection<S>(
         Arc::clone(&state.jwt),
     ));
     let max_body = config.max_body_bytes;
+    let request_timeout = config.request_timeout_secs;
 
     // ── Inner service: body collection + dispatch ──────────────────────────
     // Use tower::service_fn (not hyper::service::service_fn) so the result
@@ -145,7 +146,25 @@ pub async fn handle_connection<S>(
             };
 
             let request = HttpRequest::from_parts(parts, body_bytes);
-            let response = router.dispatch(request).await;
+            // Enforce per-request processing timeout so slow handlers
+            // cannot hold a worker indefinitely.
+            let response = match tokio::time::timeout(
+                Duration::from_secs(request_timeout),
+                router.dispatch(request),
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(_elapsed) => {
+                    warn!(
+                        peer = %peer_addr,
+                        timeout_secs = request_timeout,
+                        "Request processing timed out"
+                    );
+                    ResponseBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                        .text("503 Service Unavailable: processing timeout\n")
+                }
+            };
             Ok::<HttpResponse, Infallible>(response)
         }
     });
@@ -232,6 +251,10 @@ pub async fn handle_connection<S>(
 pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<JwtSecret>) -> Router {
     let mut router = Router::new();
 
+    // Auth credentials from config (moved out of hard-coded strings).
+    let cfg_auth_username = cfg.auth_username.clone();
+    let cfg_auth_password = cfg.auth_password.clone();
+
     router.get("/", |_req| async {
         ResponseBuilder::ok().text("Hello from rust-highperf-server\n")
     });
@@ -280,11 +303,14 @@ pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<Jwt
     // Accepts: `{"username": "...", "password": "..."}`
     // Returns: `{"token": "..."}`  or 401 on bad credentials.
     //
-    // Note: credentials are hard-coded here.  In production these would be
-    // checked against a hashed password stored in the database.
+    // Credentials are loaded from AUTH_USERNAME / AUTH_PASSWORD environment
+    // variables (see ServerConfig).  In production, replace with a database
+    // lookup against hashed passwords.
     let jwt_for_token = Arc::clone(&jwt);
     router.post("/auth/token", move |req| {
         let jwt = Arc::clone(&jwt_for_token);
+        let expected_user = cfg_auth_username.clone();
+        let expected_pass = cfg_auth_password.clone();
         async move {
             #[derive(serde::Deserialize)]
             struct LoginPayload {
@@ -298,8 +324,7 @@ pub(crate) fn build_router(cfg: &ServerConfig, db: Arc<SqlitePool>, jwt: Arc<Jwt
                         .json(&serde_json::json!({"error": "invalid JSON body"}))
                 }
             };
-            // Hard-coded credentials for demonstration purposes.
-            if payload.username != "admin" || payload.password != "secret" {
+            if payload.username != expected_user || payload.password != expected_pass {
                 return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
                     .json(&serde_json::json!({"error": "invalid credentials"}));
             }
@@ -463,6 +488,9 @@ mod tests {
             shutdown_drain_secs: 30,
             db_url: "sqlite::memory:".to_string(),
             jwt_secret: "test-secret".to_string(),
+            auth_username: "admin".to_string(),
+            auth_password: "secret".to_string(),
+            request_timeout_secs: 30,
         })
     }
 

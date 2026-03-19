@@ -47,6 +47,9 @@ where
         shutdown_drain_secs: 5,
         db_url: "sqlite::memory:".to_string(),
         jwt_secret: "test-secret".to_string(),
+        auth_username: "admin".to_string(),
+        auth_password: "secret".to_string(),
+        request_timeout_secs: 30,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

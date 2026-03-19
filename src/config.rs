@@ -70,6 +70,22 @@ pub struct ServerConfig {
     /// **Must be changed in production.**  Defaults to a placeholder value
     /// that will cause tests to warn loudly if left as-is.
     pub jwt_secret: String,
+    /// Username accepted by the `/auth/token` endpoint.
+    ///
+    /// Loaded from `AUTH_USERNAME`; defaults to `"admin"`.  Change in
+    /// production or replace with a database-backed user lookup.
+    pub auth_username: String,
+    /// Password accepted by the `/auth/token` endpoint.
+    ///
+    /// Loaded from `AUTH_PASSWORD`; defaults to `"secret"`.  **Must be
+    /// changed in production.**
+    pub auth_password: String,
+    /// Per-request processing timeout in seconds.
+    ///
+    /// If a handler takes longer than this to produce a response, the server
+    /// returns `503 Service Unavailable` and logs a warning.  Defaults to
+    /// 30 s.  Set via `REQUEST_TIMEOUT_SECS`.
+    pub request_timeout_secs: u64,
 }
 
 /// Errors that can occur when loading [`ServerConfig`].
@@ -104,6 +120,9 @@ impl ServerConfig {
     /// | `SHUTDOWN_DRAIN_SECS`    | `30`          | Graceful-shutdown drain timeout (seconds)|
     /// | `DATABASE_URL`           | `sqlite:./data.db` | SQLite database path              |
     /// | `JWT_SECRET`             | `change-me-in-production` | JWT signing secret          |
+    /// | `AUTH_USERNAME`          | `admin`           | Username for /auth/token          |
+    /// | `AUTH_PASSWORD`          | `secret`          | Password for /auth/token          |
+    /// | `REQUEST_TIMEOUT_SECS`   | `30`              | Per-request processing timeout    |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -229,6 +248,23 @@ impl ServerConfig {
         let jwt_secret =
             env::var("JWT_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
 
+        let auth_username =
+            env::var("AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let auth_password =
+            env::var("AUTH_PASSWORD").unwrap_or_else(|_| "secret".to_string());
+
+        let timeout_str =
+            env::var("REQUEST_TIMEOUT_SECS").unwrap_or_else(|_| "30".to_string());
+        let request_timeout_secs: u64 = timeout_str.parse().map_err(|_| {
+            ConfigError::InvalidValue("REQUEST_TIMEOUT_SECS".into(), timeout_str.clone())
+        })?;
+        if request_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "REQUEST_TIMEOUT_SECS".into(),
+                "must be > 0".into(),
+            ));
+        }
+
         Ok(Self {
             addr,
             workers,
@@ -246,6 +282,9 @@ impl ServerConfig {
             shutdown_drain_secs,
             db_url,
             jwt_secret,
+            auth_username,
+            auth_password,
+            request_timeout_secs,
         })
     }
 }
@@ -286,6 +325,9 @@ mod tests {
         assert!(cfg.tls_cert_path.is_none());
         assert_eq!(cfg.db_url, "sqlite:./data.db");
         assert_eq!(cfg.jwt_secret, "change-me-in-production");
+        assert_eq!(cfg.auth_username, "admin");
+        assert_eq!(cfg.auth_password, "secret");
+        assert_eq!(cfg.request_timeout_secs, 30);
     }
 
     #[test]
@@ -367,5 +409,26 @@ mod tests {
         let result = ServerConfig::from_env();
         env::remove_var("SHUTDOWN_DRAIN_SECS");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_request_timeout_secs_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("REQUEST_TIMEOUT_SECS", "0");
+        let result = ServerConfig::from_env();
+        env::remove_var("REQUEST_TIMEOUT_SECS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn custom_auth_credentials_loaded_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("AUTH_USERNAME", "myuser");
+        env::set_var("AUTH_PASSWORD", "mypass");
+        let cfg = ServerConfig::from_env().expect("config should load");
+        env::remove_var("AUTH_USERNAME");
+        env::remove_var("AUTH_PASSWORD");
+        assert_eq!(cfg.auth_username, "myuser");
+        assert_eq!(cfg.auth_password, "mypass");
     }
 }
