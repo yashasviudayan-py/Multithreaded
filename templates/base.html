@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}rust-highperf-server{% endblock %}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    nav  { display: flex; gap: 1.5rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: .5rem; }
+    nav a { text-decoration: none; color: #0070f3; font-weight: 500; }
+    nav a:hover { text-decoration: underline; }
+    .flash { padding: .6rem 1rem; border-radius: 4px; margin-bottom: 1rem; }
+    .flash.success { background: #d4edda; color: #155724; }
+    .flash.error   { background: #f8d7da; color: #721c24; }
+    pre { background: #f5f5f5; padding: 1rem; border-radius: 4px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: .5rem .75rem; text-align: left; }
+    th { background: #f0f0f0; }
+    form input, form button { padding: .5rem .75rem; margin: .25rem 0; border: 1px solid #ccc; border-radius: 4px; }
+    form button { background: #0070f3; color: white; border: none; cursor: pointer; }
+    form button:hover { background: #0051a8; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/ui/items">Items</a>
+    <a href="/ui/metrics">Metrics</a>
+    {% if session_user %}<span>👤 {{ session_user }}</span> <a href="/ui/logout">Logout</a>
+    {% else %}<a href="/ui/login">Login</a>{% endif %}
+  </nav>
+  {% if flash %}<div class="flash {{ flash_type | default(value='success') }}">{{ flash }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</body>
+</html>

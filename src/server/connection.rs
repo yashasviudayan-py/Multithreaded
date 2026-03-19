@@ -56,7 +56,9 @@ use crate::middleware::{
     extract_bearer, ConcurrencyLimiterLayer, JwtSecret, LoggingLayer, RateLimiter, RateLimiterLayer,
 };
 use crate::server::task::run_blocking;
+use crate::session::{extract_session_cookie, SessionStore};
 use crate::static_files;
+use crate::templates::TemplateEngine;
 
 /// Shared application state threaded through every connection.
 ///
@@ -71,6 +73,10 @@ pub struct AppState {
     pub jwt: Arc<JwtSecret>,
     /// Prometheus-compatible server metrics counters.
     pub metrics: Arc<Metrics>,
+    /// Cookie-based session store (server-side, UUID tokens).
+    pub sessions: Arc<SessionStore>,
+    /// Tera HTML template engine (`None` when `templates/` dir is missing).
+    pub template_engine: Option<TemplateEngine>,
 }
 
 /// Drive a single accepted connection to completion.
@@ -103,6 +109,8 @@ pub async fn handle_connection<S>(
         Arc::clone(&state.db_pool),
         Arc::clone(&state.jwt),
         Arc::clone(&state.metrics),
+        Arc::clone(&state.sessions),
+        state.template_engine.clone(),
     ));
     let max_body = config.max_body_bytes;
     let request_timeout = config.request_timeout_secs;
@@ -275,6 +283,8 @@ pub(crate) fn build_router(
     db: Arc<SqlitePool>,
     jwt: Arc<JwtSecret>,
     metrics: Arc<Metrics>,
+    sessions: Arc<SessionStore>,
+    tmpl: Option<TemplateEngine>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -473,6 +483,233 @@ pub(crate) fn build_router(
         }
     });
 
+    // ── HTML UI routes (require TemplateEngine) ────────────────────────────
+    // These routes are only registered when `templates/` is present at startup.
+    // They provide a browser-friendly interface backed by the same SQLite DB.
+    if let Some(ref engine) = tmpl {
+        // Helper: extract current session user from Cookie header.
+        // Shared across all /ui routes via Arc<SessionStore>.
+
+        // GET /ui — redirect to /ui/index
+        router.get("/ui", |_req| async {
+            ResponseBuilder::new(hyper::StatusCode::FOUND)
+                .header("location", "/ui/index")
+                .empty()
+        });
+
+        // GET /ui/index — home page
+        let e = engine.clone();
+        let sess_home = Arc::clone(&sessions);
+        router.get("/ui/index", move |req| {
+            let engine = e.clone();
+            let sessions = Arc::clone(&sess_home);
+            async move {
+                let token = req.header("cookie").and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let mut ctx = tera::Context::new();
+                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
+                engine.render("index.html", &ctx)
+            }
+        });
+
+        // GET /ui/login
+        let e = engine.clone();
+        router.get("/ui/login", move |_req| {
+            let engine = e.clone();
+            async move {
+                let ctx = tera::Context::new();
+                engine.render("login.html", &ctx)
+            }
+        });
+
+        // POST /ui/login — verify credentials, set session cookie
+        let e = engine.clone();
+        let sess_login = Arc::clone(&sessions);
+        let login_user = cfg.auth_username.clone();
+        let login_pass = cfg.auth_password.clone();
+        router.post("/ui/login", move |req| {
+            let engine = e.clone();
+            let sessions = Arc::clone(&sess_login);
+            let expected_user = login_user.clone();
+            let expected_pass = login_pass.clone();
+            async move {
+                // Parse application/x-www-form-urlencoded body.
+                let body_str = String::from_utf8_lossy(&req.body).to_string();
+                let mut username = String::new();
+                let mut password = String::new();
+                for pair in body_str.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        let val = v.replace('+', " ");
+                        let decoded = percent_encoding::percent_decode_str(&val)
+                            .decode_utf8_lossy()
+                            .to_string();
+                        if k == "username" { username = decoded.clone(); }
+                        if k == "password" { password = decoded; }
+                    }
+                }
+                if username == expected_user && password == expected_pass {
+                    let token = sessions.create(username.clone());
+                    let cookie = format!(
+                        "session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600"
+                    );
+                    ResponseBuilder::new(hyper::StatusCode::FOUND)
+                        .header("location", "/ui/items")
+                        .header("set-cookie", &cookie)
+                        .empty()
+                } else {
+                    let mut ctx = tera::Context::new();
+                    ctx.insert("flash", "Invalid username or password.");
+                    ctx.insert("flash_type", "error");
+                    engine.render("login.html", &ctx)
+                }
+            }
+        });
+
+        // GET /ui/logout — destroy session
+        let sess_logout = Arc::clone(&sessions);
+        router.get("/ui/logout", move |req| {
+            let sessions = Arc::clone(&sess_logout);
+            async move {
+                let token = req.header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                if let Some(t) = token.as_deref() {
+                    sessions.remove(t);
+                }
+                ResponseBuilder::new(hyper::StatusCode::FOUND)
+                    .header("location", "/ui/login")
+                    .header("set-cookie", "session=; Max-Age=0; Path=/")
+                    .empty()
+            }
+        });
+
+        // GET /ui/items — list items (HTML)
+        let e = engine.clone();
+        let db_ui_list = Arc::clone(&db);
+        let sess_items = Arc::clone(&sessions);
+        router.get("/ui/items", move |req| {
+            let engine = e.clone();
+            let pool = Arc::clone(&db_ui_list);
+            let sessions = Arc::clone(&sess_items);
+            async move {
+                let token = req.header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let items = db::list_items(&pool).await.unwrap_or_default();
+                let mut ctx = tera::Context::new();
+                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
+                ctx.insert("items", &items);
+                // Pass any flash message from query string.
+                if let Some(msg) = req.query_param("flash") {
+                    ctx.insert("flash", &msg);
+                }
+                engine.render("items.html", &ctx)
+            }
+        });
+
+        // POST /ui/items — create item (requires session)
+        let e = engine.clone();
+        let db_ui_create = Arc::clone(&db);
+        let sess_create = Arc::clone(&sessions);
+        router.post("/ui/items", move |req| {
+            let engine = e.clone();
+            let pool = Arc::clone(&db_ui_create);
+            let sessions = Arc::clone(&sess_create);
+            async move {
+                let token = req.header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
+                    return ResponseBuilder::new(hyper::StatusCode::FOUND)
+                        .header("location", "/ui/login")
+                        .empty();
+                }
+                let body_str = String::from_utf8_lossy(&req.body).to_string();
+                let mut name = String::new();
+                let mut description = String::new();
+                for pair in body_str.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        let val = v.replace('+', " ");
+                        let decoded = percent_encoding::percent_decode_str(&val)
+                            .decode_utf8_lossy()
+                            .to_string();
+                        if k == "name"        { name = decoded.clone(); }
+                        if k == "description" { description = decoded; }
+                    }
+                }
+                match db::create_item(&pool, &name, &description).await {
+                    Ok(_) => ResponseBuilder::new(hyper::StatusCode::FOUND)
+                        .header("location", "/ui/items?flash=Item+created")
+                        .empty(),
+                    Err(e) => {
+                        error!(err = %e, "ui create_item failed");
+                        let items = db::list_items(&pool).await.unwrap_or_default();
+                        let mut ctx = tera::Context::new();
+                        ctx.insert("items", &items);
+                        ctx.insert("flash", "Failed to create item.");
+                        ctx.insert("flash_type", "error");
+                        engine.render("items.html", &ctx)
+                    }
+                }
+            }
+        });
+
+        // POST /ui/items/:id/delete — delete item (requires session)
+        let db_ui_delete = Arc::clone(&db);
+        let sess_delete = Arc::clone(&sessions);
+        router.post("/ui/items/:id/delete", move |req| {
+            let pool = Arc::clone(&db_ui_delete);
+            let sessions = Arc::clone(&sess_delete);
+            async move {
+                let token = req.header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
+                    return ResponseBuilder::new(hyper::StatusCode::FOUND)
+                        .header("location", "/ui/login")
+                        .empty();
+                }
+                let id = req.path_param("id").unwrap_or("").to_string();
+                match db::delete_item(&pool, &id).await {
+                    Ok(_) => ResponseBuilder::new(hyper::StatusCode::FOUND)
+                        .header("location", "/ui/items?flash=Item+deleted")
+                        .empty(),
+                    Err(e) => {
+                        error!(err = %e, "ui delete_item failed");
+                        ResponseBuilder::new(hyper::StatusCode::FOUND)
+                            .header("location", "/ui/items")
+                            .empty()
+                    }
+                }
+            }
+        });
+
+        // GET /ui/metrics — HTML metrics dashboard
+        let e = engine.clone();
+        let m_ui = Arc::clone(&metrics);
+        let sess_metrics = Arc::clone(&sessions);
+        router.get("/ui/metrics", move |req| {
+            let engine = e.clone();
+            let m = Arc::clone(&m_ui);
+            let sessions = Arc::clone(&sess_metrics);
+            async move {
+                let token = req.header("cookie")
+                    .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let mut ctx = tera::Context::new();
+                if let Some(ref u) = session_user { ctx.insert("session_user", u); }
+                ctx.insert("requests_total",       &m.requests_total.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("requests_active",      &m.requests_active.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("responses_2xx",        &m.responses_2xx.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("responses_4xx",        &m.responses_4xx.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("responses_5xx",        &m.responses_5xx.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("rate_limited",         &m.rate_limited.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("concurrency_limited",  &m.concurrency_limited.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("timed_out",            &m.timed_out.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("connections_accepted", &m.connections_accepted.load(std::sync::atomic::Ordering::Relaxed));
+                ctx.insert("connections_rejected_ip", &m.connections_rejected_ip.load(std::sync::atomic::Ordering::Relaxed));
+                engine.render("metrics.html", &ctx)
+            }
+        });
+    }
+
     // GET /metrics — Prometheus-compatible metrics endpoint.
     //
     // Returns all server counters in the Prometheus text exposition format
@@ -565,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn health_route_returns_ok() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "ok\n");
@@ -574,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn root_route_returns_server_name() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_str(resp).await.contains("rust-highperf-server"));
@@ -583,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn echo_path_param_returned() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/echo/world")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "world\n");
@@ -592,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_returns_404() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/not-a-route")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -608,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_returns_correct_value() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/fib/10")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_str(resp).await, "55\n");
@@ -617,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn fib_route_caps_at_50() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         // n=999 should be capped to 50 → fib(50) = 12586269025
         let resp = router.dispatch(make_req(Method::GET, "/fib/999")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -627,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn response_has_server_header() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router.dispatch(make_req(Method::GET, "/health")).await;
         assert_eq!(
             resp.headers().get("server").unwrap(),
@@ -638,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn static_route_returns_404_for_missing_file() {
         let cfg = test_config();
-        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new());
+        let router = build_router(&cfg, test_db().await, test_jwt(), Metrics::new(), Arc::new(SessionStore::new()), None);
         let resp = router
             .dispatch(make_req(Method::GET, "/static/nonexistent.txt"))
             .await;

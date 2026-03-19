@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Login — rust-highperf-server{% endblock %}
+{% block content %}
+<h1>Login</h1>
+<form method="POST" action="/ui/login">
+  <div>
+    <label>Username<br>
+      <input type="text" name="username" required autofocus>
+    </label>
+  </div>
+  <div>
+    <label>Password<br>
+      <input type="password" name="password" required>
+    </label>
+  </div>
+  <div>
+    <button type="submit">Login</button>
+  </div>
+</form>
+{% endblock %}

@@ -50,6 +50,17 @@ jsonwebtoken = "9"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Phase 9: HTML templating (full web app support)
+tera = "1"
+
+# Phase 9: Secure cookie-based session management (HMAC-SHA256 signed cookies)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# URL percent-decoding for HTML form submissions
+percent-encoding = "2"
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tokio-test = "0.4"

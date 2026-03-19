@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Items — rust-highperf-server{% endblock %}
+{% block content %}
+<h1>Items</h1>
+{% if session_user %}
+<form method="POST" action="/ui/items">
+  <h2>Create Item</h2>
+  <div>
+    <label>Name<br><input type="text" name="name" required></label>
+  </div>
+  <div>
+    <label>Description<br><input type="text" name="description" required></label>
+  </div>
+  <button type="submit">Create</button>
+</form>
+<hr>
+{% endif %}
+<h2>All Items</h2>
+{% if items %}
+<table>
+  <thead><tr><th>Name</th><th>Description</th><th>ID</th>{% if session_user %}<th>Actions</th>{% endif %}</tr></thead>
+  <tbody>
+  {% for item in items %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.description }}</td>
+      <td><code>{{ item.id }}</code></td>
+      {% if session_user %}
+      <td>
+        <form method="POST" action="/ui/items/{{ item.id }}/delete" style="display:inline">
+          <button type="submit" onclick="return confirm('Delete this item?')">Delete</button>
+        </form>
+      </td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No items yet. {% if session_user %}Create one above.{% else %}<a href="/ui/login">Login</a> to create items.{% endif %}</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Server Metrics{% endblock %}
+{% block content %}
+<h1>Server Metrics</h1>
+<table>
+  <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>Requests (total)</td><td>{{ requests_total }}</td></tr>
+    <tr><td>Requests (active)</td><td>{{ requests_active }}</td></tr>
+    <tr><td>Responses 2xx</td><td>{{ responses_2xx }}</td></tr>
+    <tr><td>Responses 4xx</td><td>{{ responses_4xx }}</td></tr>
+    <tr><td>Responses 5xx</td><td>{{ responses_5xx }}</td></tr>
+    <tr><td>Rate limited (429)</td><td>{{ rate_limited }}</td></tr>
+    <tr><td>Concurrency limited (503)</td><td>{{ concurrency_limited }}</td></tr>
+    <tr><td>Timed out</td><td>{{ timed_out }}</td></tr>
+    <tr><td>Connections accepted</td><td>{{ connections_accepted }}</td></tr>
+    <tr><td>Connections rejected (IP)</td><td>{{ connections_rejected_ip }}</td></tr>
+  </tbody>
+</table>
+<p><small>Raw Prometheus format: <a href="/metrics">/metrics</a></small></p>
+{% endblock %}

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}rust-highperf-server{% endblock %}
+{% block content %}
+<h1>rust-highperf-server</h1>
+<p>A high-performance multithreaded HTTP/HTTPS web server built in Rust.</p>
+<h2>Features</h2>
+<ul>
+  <li>HTTP/1.1 and HTTP/2 via ALPN auto-negotiation</li>
+  <li>TLS via <code>rustls</code> (no OpenSSL)</li>
+  <li>JWT authentication (HMAC-SHA256)</li>
+  <li>SQLite CRUD API via <code>sqlx</code></li>
+  <li>HTML templating via <code>Tera</code></li>
+  <li>Secure signed session cookies</li>
+  <li>Prometheus-compatible <code>/metrics</code> endpoint</li>
+  <li>IP allowlist / blocklist</li>
+  <li>Per-request timeout enforcement</li>
+</ul>
+<p><a href="/ui/items">Browse Items →</a></p>
+{% endblock %}

@@ -37,6 +37,8 @@ use crate::db;
 use crate::metrics::Metrics;
 use crate::middleware::{JwtSecret, RateLimiter};
 use crate::server::connection::{handle_connection, AppState};
+use crate::session::SessionStore;
+use crate::templates::TemplateEngine;
 use crate::tls::{load_tls_acceptor, TlsError};
 
 /// Errors that can occur while binding or running the server.
@@ -180,7 +182,9 @@ impl Server {
         let db_pool = Arc::new(db::init_pool(&self.config.db_url, self.config.db_pool_size).await?);
         let jwt = Arc::new(JwtSecret::new(&self.config.jwt_secret));
         let metrics = Metrics::new();
-        let app_state = AppState { db_pool, jwt, metrics };
+        let sessions = Arc::new(SessionStore::new());
+        let template_engine = TemplateEngine::new("templates");
+        let app_state = AppState { db_pool, jwt, metrics, sessions, template_engine };
 
         let config = Arc::new(self.config);
 
