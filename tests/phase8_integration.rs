@@ -85,7 +85,10 @@ where
 async fn auth_token_valid_credentials_returns_jwt() {
     let cfg = base_cfg("127.0.0.1:0".parse().unwrap());
     with_server(cfg, |addr| async move {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let resp = client
             .post(format!("http://{addr}/auth/token"))
             .json(&serde_json::json!({"username": "admin", "password": "secret"}))
@@ -118,6 +121,76 @@ async fn auth_token_wrong_password_returns_401() {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
+    })
+    .await;
+}
+
+/// The server-rendered UI is discoverable, uses database-backed login, and
+/// rejects state-changing requests that omit the per-session CSRF token.
+#[tokio::test]
+async fn browser_ui_uses_session_and_csrf_protection() {
+    let cfg = base_cfg("127.0.0.1:0".parse().unwrap());
+    with_server(cfg, |addr| async move {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let root = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(root.status(), 302);
+        assert_eq!(root.headers().get("location").unwrap(), "/ui/index");
+
+        let login = client
+            .post(format!("http://{addr}/ui/login"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("username=admin&password=secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), 302);
+        let cookie = login
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let items = client
+            .get(format!("http://{addr}/ui/items"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        let html = items.text().await.unwrap();
+        let csrf = html
+            .split("name=\"_csrf\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+
+        let missing_csrf = client
+            .post(format!("http://{addr}/ui/items"))
+            .header("cookie", &cookie)
+            .body("name=blocked&description=blocked")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), 403);
+
+        let created = client
+            .post(format!("http://{addr}/ui/items"))
+            .header("cookie", &cookie)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("_csrf={csrf}&name=web&description=created+from+ui"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 302);
     })
     .await;
 }

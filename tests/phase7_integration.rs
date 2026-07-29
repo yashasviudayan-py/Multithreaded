@@ -189,7 +189,7 @@ async fn https_root_route_returns_server_name() {
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert!(
-            body.contains("rust-highperf-server"),
+            body.contains("Build fast services"),
             "Unexpected body: {body}"
         );
     })

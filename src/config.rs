@@ -76,10 +76,11 @@ pub struct ServerConfig {
     /// Loaded from `AUTH_USERNAME`; defaults to `"admin"`.  Change in
     /// production or replace with a database-backed user lookup.
     pub auth_username: String,
-    /// Password accepted by the `/auth/token` endpoint.
+    /// Bootstrap password used only to create the initial database user.
     ///
-    /// Loaded from `AUTH_PASSWORD`; defaults to `"secret"`.  **Must be
-    /// changed in production.**
+    /// Loaded from `AUTH_PASSWORD`; defaults to `"secret"`. Production should
+    /// instead set `AUTH_PASSWORD_HASH` to a pre-generated Argon2id hash so a
+    /// plaintext bootstrap password is never placed in the environment.
     pub auth_password: String,
     /// Per-request processing timeout in seconds.
     ///

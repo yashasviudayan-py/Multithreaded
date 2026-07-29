@@ -57,6 +57,16 @@ impl TemplateEngine {
         match self.tera.render(template_name, ctx) {
             Ok(html) => ResponseBuilder::ok()
                 .header("content-type", "text/html; charset=utf-8")
+                // The UI has no third-party resources or scripts. Keep the
+                // policy deliberately tight; inline styles are required by
+                // these self-contained templates.
+                .header(
+                    "content-security-policy",
+                    "default-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+                )
+                .header("x-content-type-options", "nosniff")
+                .header("x-frame-options", "DENY")
+                .header("referrer-policy", "no-referrer")
                 .text(html),
             Err(e) => {
                 error!(template = template_name, err = %e, "Template render error");
@@ -86,5 +96,7 @@ mod tests {
         let resp = engine.render("index.html", &ctx);
         // Should succeed — status 200 with HTML body.
         assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+        assert!(resp.headers().contains_key("content-security-policy"));
     }
 }

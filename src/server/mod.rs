@@ -177,12 +177,25 @@ impl Server {
         // regardless of request volume (complements the call-count-based sweep).
         Arc::clone(&rate_limiter).start_eviction_task();
 
-        // ── Phase 8: Database pool + JWT secret ───────────────────────────────
-        // Initialise SQLite connection pool once at startup and share via Arc.
+        // ── Database pool + authentication state ──────────────────────────────
         let db_pool = Arc::new(db::init_pool(&self.config.db_url, self.config.db_pool_size).await?);
+        match std::env::var("AUTH_PASSWORD_HASH") {
+            Ok(hash) => {
+                db::create_user_with_hash_if_missing(&db_pool, &self.config.auth_username, &hash)
+                    .await
+                    .map_err(db::DbError::from)?
+            }
+            Err(_) => db::create_user_if_missing(
+                &db_pool,
+                &self.config.auth_username,
+                &self.config.auth_password,
+            )
+            .await
+            .map_err(db::DbError::from)?,
+        }
         let jwt = Arc::new(JwtSecret::new(&self.config.jwt_secret));
         let metrics = Metrics::new();
-        let sessions = Arc::new(SessionStore::new());
+        let sessions = Arc::new(SessionStore::new(Arc::clone(&db_pool)));
         let template_engine = TemplateEngine::new("templates");
         let proxy_client = self.config.proxy_upstream.as_ref().map(|upstream| {
             info!(upstream = %upstream, "Reverse-proxy mode enabled");
@@ -345,6 +358,14 @@ impl Server {
         }
 
         // ── Graceful shutdown drain ───────────────────────────────────────────
+        // Give already-accepted sockets a brief opportunity to finish HTTP
+        // parsing and enter the request service before asking Hyper to close
+        // them. Without this settle window a shutdown that races an accepted
+        // TCP connection can reset a request before it becomes in-flight.
+        if in_flight.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         // Signal all active connections to close after their current request.
         let _ = shutdown_tx.send(true);
 

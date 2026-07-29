@@ -86,7 +86,7 @@ async fn get_root_still_returns_200() {
             .await
             .expect("request failed");
         assert_eq!(resp.status().as_u16(), 200);
-        assert!(resp.text().await.unwrap().contains("rust-highperf-server"));
+        assert!(resp.text().await.unwrap().contains("Build fast services"));
     })
     .await;
 }

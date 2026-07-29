@@ -1,19 +1,21 @@
 {% extends "base.html" %}
-{% block title %}rust-highperf-server{% endblock %}
+{% block title %}Threadline — secure Rust HTTP server{% endblock %}
 {% block content %}
-<h1>rust-highperf-server</h1>
-<p>A high-performance multithreaded HTTP/HTTPS web server built in Rust.</p>
-<h2>Features</h2>
-<ul>
-  <li>HTTP/1.1 and HTTP/2 via ALPN auto-negotiation</li>
-  <li>TLS via <code>rustls</code> (no OpenSSL)</li>
-  <li>JWT authentication (HMAC-SHA256)</li>
-  <li>SQLite CRUD API via <code>sqlx</code></li>
-  <li>HTML templating via <code>Tera</code></li>
-  <li>Secure signed session cookies</li>
-  <li>Prometheus-compatible <code>/metrics</code> endpoint</li>
-  <li>IP allowlist / blocklist</li>
-  <li>Per-request timeout enforcement</li>
-</ul>
-<p><a href="/ui/items">Browse Items →</a></p>
+<main>
+  <section style="padding:84px 0 42px;max-width:850px">
+    <p class="eyebrow">Rust HTTP/HTTPS server</p>
+    <h1>Build fast services.<br><span style="color:var(--brand)">Keep the guardrails.</span></h1>
+    <p style="font-size:1.2rem;max-width:710px">Threadline is a practical server foundation for internal APIs, edge services, admin tools, and lightweight reverse proxies—where predictable concurrency, TLS, metrics, and sane security matter.</p>
+    <p style="display:flex;gap:10px;flex-wrap:wrap;margin-top:28px"><a class="button" href="/ui/items">Try the UI demo</a><a class="button secondary" href="/metrics">View Prometheus metrics</a></p>
+  </section>
+  <section class="grid">
+    <article class="card"><p class="eyebrow">Where it fits</p><h2>Service edge</h2><p>Terminate TLS, set backpressure, limit abusive clients, and proxy unmatched paths to an upstream application.</p></article>
+    <article class="card"><p class="eyebrow">Where it fits</p><h2>API platform</h2><p>Serve JSON CRUD APIs with JWT auth, SQLite or PostgreSQL persistence, and HTTP/2 support.</p></article>
+    <article class="card"><p class="eyebrow">Where it fits</p><h2>Operations demo</h2><p>Show a complete Rust web stack: templates, database sessions, CSRF-protected forms, and live metrics.</p></article>
+  </section>
+  <section class="section"><p class="eyebrow">Request lifecycle</p><h2>One request, observable end to end</h2>
+    <div class="card" style="overflow:auto"><div style="display:flex;min-width:720px;align-items:stretch;gap:10px;text-align:center;font-weight:700"><div style="flex:1">Client<br><small class="muted">HTTP/1.1 or h2</small></div><div>→</div><div style="flex:1">TLS + IP filter<br><small class="muted">early rejection</small></div><div>→</div><div style="flex:1">Rate + concurrency<br><small class="muted">429 / 503</small></div><div>→</div><div style="flex:1">Router<br><small class="muted">API, UI, static, proxy</small></div><div>→</div><div style="flex:1">Metrics + logs<br><small class="muted">Prometheus / tracing</small></div></div></div>
+  </section>
+  <section class="section"><p class="eyebrow">Why use it</p><div class="grid"><article class="card"><h2>Protocol without lock-in</h2><p>Hyper and Tokio provide async I/O; rustls avoids an OpenSSL runtime dependency.</p></article><article class="card"><h2>Protection by default</h2><p>Body limits, per-IP rate limiting, global concurrency limits, secure cookie attributes, and CSRF checks are built into the request path.</p></article><article class="card"><h2>Ready to inspect</h2><p>Structured logs, request IDs, and Prometheus-compatible counters make behavior visible in production.</p></article></div></section>
+</main>
 {% endblock %}

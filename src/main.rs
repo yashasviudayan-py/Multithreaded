@@ -32,11 +32,13 @@ fn main() -> Result<()> {
              before deploying to production."
         );
     }
-    if config.auth_username == "admin" && config.auth_password == "secret" {
+    if config.auth_username == "admin"
+        && config.auth_password == "secret"
+        && std::env::var("AUTH_PASSWORD_HASH").is_err()
+    {
         warn!(
-            "AUTH_USERNAME and AUTH_PASSWORD are using default credentials \
-             ('admin'/'secret'). Set AUTH_USERNAME and AUTH_PASSWORD environment \
-             variables before deploying to production."
+            "The default administrator bootstrap password is active. Set \
+             AUTH_PASSWORD_HASH (preferred) or AUTH_PASSWORD before deploying."
         );
     }
 

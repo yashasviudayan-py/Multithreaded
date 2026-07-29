@@ -13,7 +13,7 @@ metrics = []
 # Phase 9: Enable PostgreSQL backend in addition to SQLite.
 # When enabled, DATABASE_URL must be a postgres:// URL.
 # Compile with: cargo build --features postgres
-postgres = []
+postgres = ["sqlx/postgres"]
 
 [dependencies]
 # Async runtime and networking
@@ -55,6 +55,7 @@ jsonwebtoken = "9"
 # compile the PostgreSQL backend (requires libpq or a compatible driver).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
 uuid = { version = "1", features = ["v4"] }
+argon2 = "0.5"
 
 # Phase 9: HTML templating (full web app support)
 tera = "1"

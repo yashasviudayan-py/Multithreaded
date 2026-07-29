@@ -1,35 +1,37 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{% block title %}rust-highperf-server{% endblock %}</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A Rust HTTP server with secure defaults, observability, and reverse-proxy support.">
+  <title>{% block title %}Threadline — Rust server{% endblock %}</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    nav  { display: flex; gap: 1.5rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: .5rem; }
-    nav a { text-decoration: none; color: #0070f3; font-weight: 500; }
-    nav a:hover { text-decoration: underline; }
-    .flash { padding: .6rem 1rem; border-radius: 4px; margin-bottom: 1rem; }
-    .flash.success { background: #d4edda; color: #155724; }
-    .flash.error   { background: #f8d7da; color: #721c24; }
-    pre { background: #f5f5f5; padding: 1rem; border-radius: 4px; overflow-x: auto; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: .5rem .75rem; text-align: left; }
-    th { background: #f0f0f0; }
-    form input, form button { padding: .5rem .75rem; margin: .25rem 0; border: 1px solid #ccc; border-radius: 4px; }
-    form button { background: #0070f3; color: white; border: none; cursor: pointer; }
-    form button:hover { background: #0051a8; }
+    :root { --ink:#e8eef9; --muted:#a8b5cc; --panel:#111b31; --line:#263754; --brand:#6ee7d0; --accent:#8ba7ff; --danger:#ff8e98; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); background:#08111f; font:16px/1.55 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .shell { max-width:1120px; margin:auto; padding:0 24px 64px; } nav { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:20px 0; border-bottom:1px solid var(--line); }
+    .brand { color:var(--ink); font-weight:800; letter-spacing:-.04em; text-decoration:none; } .brand i { color:var(--brand); font-style:normal; } .links { display:flex; flex-wrap:wrap; align-items:center; gap:18px; }
+    a { color:var(--brand); } .links a { color:var(--muted); text-decoration:none; } .links a:hover { color:var(--ink); } .user { color:var(--muted); font-size:.9rem; }
+    h1 { letter-spacing:-.055em; font-size:clamp(2.4rem,7vw,5.2rem); line-height:1; margin:.2em 0; } h2 { letter-spacing:-.035em; } p { color:var(--muted); } code { color:#cad6ff; }
+    .flash { padding:.75rem 1rem; border-radius:8px; margin:1rem 0; background:#183953; color:#b8f1ff; } .flash.error { background:#4b202d; color:#ffd1d6; }
+    .button, button { display:inline-block; padding:.7rem 1rem; border:1px solid transparent; border-radius:8px; background:var(--brand); color:#05221f; font-weight:700; text-decoration:none; cursor:pointer; }
+    .button.secondary { background:transparent; color:var(--ink); border-color:var(--line); } input { width:100%; padding:.7rem .8rem; color:var(--ink); background:#0d1729; border:1px solid var(--line); border-radius:7px; }
+    .card { padding:1.4rem; background:linear-gradient(145deg,#14213a,#0d1729); border:1px solid var(--line); border-radius:12px; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+    table { width:100%; border-collapse:collapse; } th,td { padding:.75rem; border-bottom:1px solid var(--line); text-align:left; } th { color:var(--muted); font-size:.82rem; text-transform:uppercase; }
+    .eyebrow { color:var(--brand); font-size:.8rem; font-weight:800; letter-spacing:.11em; text-transform:uppercase; } .section { margin-top:72px; } .muted { color:var(--muted); }
+    @media (max-width:640px) { nav { align-items:flex-start; flex-direction:column; } .shell { padding-inline:18px; } }
   </style>
 </head>
 <body>
-  <nav>
-    <a href="/">Home</a>
-    <a href="/ui/items">Items</a>
-    <a href="/ui/metrics">Metrics</a>
-    {% if session_user %}<span>👤 {{ session_user }}</span> <a href="/ui/logout">Logout</a>
-    {% else %}<a href="/ui/login">Login</a>{% endif %}
-  </nav>
-  {% if flash %}<div class="flash {{ flash_type | default(value='success') }}">{{ flash }}</div>{% endif %}
-  {% block content %}{% endblock %}
+  <div class="shell">
+    <nav>
+      <a class="brand" href="/ui/index">thread<i>line</i></a>
+      <div class="links">
+        <a href="/ui/index">Overview</a><a href="/ui/items">Demo data</a><a href="/ui/metrics">Metrics</a>
+        {% if session_user %}<span class="user">Signed in as {{ session_user }}</span><form method="POST" action="/ui/logout" style="display:inline"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button style="padding:0;background:transparent;color:var(--muted);font-weight:400">Log out</button></form>{% else %}<a href="/ui/login">Sign in</a>{% endif %}
+      </div>
+    </nav>
+    {% if flash %}<div class="flash {{ flash_type | default(value='success') }}">{{ flash }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </div>
 </body>
 </html>

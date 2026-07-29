@@ -132,7 +132,7 @@ async fn concurrency_limiter_returns_503_when_saturated() {
         .map(|r| r.unwrap())
         .collect();
 
-    let got_503 = statuses.iter().any(|&s| s == 503);
+    let got_503 = statuses.contains(&503);
     assert!(
         got_503,
         "expected at least one 503 with concurrency cap=1; got: {statuses:?}"
@@ -314,6 +314,19 @@ async fn graceful_shutdown_completes_in_flight_requests() {
     let addr = ready_rx.await.unwrap();
     let client = reqwest::Client::new();
 
+    // Establish the client connection before testing the shutdown drain; this
+    // avoids making the assertion depend on scheduler timing between a brand
+    // new TCP connect and the shutdown notification.
+    assert_eq!(
+        client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
     // Kick off a slow (CPU-bound) request that will be in-flight when we
     // send the shutdown signal.
     let resp_fut = tokio::spawn({
@@ -322,7 +335,10 @@ async fn graceful_shutdown_completes_in_flight_requests() {
     });
 
     // Give the request time to start processing, then trigger shutdown.
-    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    // Allow TCP accept and request dispatch to begin before broadcasting the
+    // shutdown signal. `/fib/45` itself is intentionally efficient, so a
+    // short 20ms delay can race the first connection on busy CI workers.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     let _ = shutdown_tx.send(());
 
     // The in-flight request must complete with the correct answer.

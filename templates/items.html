@@ -4,6 +4,7 @@
 <h1>Items</h1>
 {% if session_user %}
 <form method="POST" action="/ui/items">
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
   <h2>Create Item</h2>
   <div>
     <label>Name<br><input type="text" name="name" required></label>
@@ -28,6 +29,7 @@
       {% if session_user %}
       <td>
         <form method="POST" action="/ui/items/{{ item.id }}/delete" style="display:inline">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <button type="submit" onclick="return confirm('Delete this item?')">Delete</button>
         </form>
       </td>

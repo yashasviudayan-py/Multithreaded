@@ -1,172 +1,139 @@
-//! Cookie-based session management.
+//! Database-backed cookie sessions.
 //!
-//! Sessions are stored server-side in a [`DashMap`] keyed by a random session
-//! token.  The token is placed in a `Set-Cookie: session=<token>; HttpOnly;
-//! SameSite=Strict` response header so it is inaccessible to JavaScript.
-//!
-//! The token itself is a UUID v4 (128 bits of randomness), not a signed value:
-//! server-side storage means the token is meaningless without the in-memory map.
-//! Tokens expire after [`SESSION_TTL`] of inactivity and are evicted by
-//! [`SessionStore::evict_expired`], called on every access.
-//!
-//! # Usage
-//! ```rust,ignore
-//! // Create once at startup:
-//! let sessions = Arc::new(SessionStore::new());
-//!
-//! // On login:
-//! let token = sessions.create(username.clone());
-//! let cookie = format!("session={token}; HttpOnly; SameSite=Strict; Path=/");
-//!
-//! // On each request:
-//! if let Some(user) = sessions.get(&token) {
-//!     // authenticated
-//! }
-//!
-//! // On logout:
-//! sessions.remove(&token);
-//! ```
+//! Keeping session records in the application database makes authenticated UI
+//! requests work across restarts and across multiple server replicas that use
+//! the same database. Cookies contain only random UUIDs; the user identity and
+//! CSRF secret remain server-side.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
 use uuid::Uuid;
 
-/// How long a session stays alive without any activity.
-pub const SESSION_TTL: Duration = Duration::from_secs(3600); // 1 hour
+use crate::db::DbPool;
 
-/// A single session slot.
-struct Session {
-    username: String,
-    /// Timestamp of the last access; updated on every [`SessionStore::get`].
-    last_accessed: Instant,
+/// How long a session stays valid, in seconds.
+pub const SESSION_TTL_SECS: u64 = 3600;
+
+/// Server-side data associated with an authenticated browser session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// Authenticated account name.
+    pub username: String,
+    /// Per-session token required for state-changing HTML form submissions.
+    pub csrf_token: String,
 }
 
-/// In-memory session store.
-///
-/// Create one instance per server startup and share via `Arc`.
+/// Session store backed by the shared application database.
+#[derive(Clone)]
 pub struct SessionStore {
-    sessions: DashMap<String, Session>,
-    /// Call counter used to schedule periodic eviction sweeps.
-    access_count: AtomicU64,
+    pool: Arc<DbPool>,
 }
 
 impl SessionStore {
-    /// Create a new, empty session store.
-    pub fn new() -> Self {
-        Self {
-            sessions: DashMap::new(),
-            access_count: AtomicU64::new(0),
-        }
+    /// Construct a store using the application's database pool.
+    pub fn new(pool: Arc<DbPool>) -> Self {
+        Self { pool }
     }
 
-    /// Create a new session for `username` and return its token.
-    ///
-    /// The token is a UUID v4 string suitable for use as a cookie value.
-    pub fn create(&self, username: String) -> String {
+    /// Create a session and return its opaque cookie token.
+    pub async fn create(&self, username: String) -> Result<String, sqlx::Error> {
         let token = Uuid::new_v4().to_string();
-        self.sessions.insert(
-            token.clone(),
-            Session {
-                username,
-                last_accessed: Instant::now(),
-            },
-        );
-        token
+        let csrf_token = Uuid::new_v4().to_string();
+        let expires_at = now_secs() + SESSION_TTL_SECS as i64;
+        sqlx::query("INSERT INTO sessions (token, username, csrf_token, expires_at) VALUES ($1, $2, $3, $4)")
+            .bind(&token)
+            .bind(username)
+            .bind(csrf_token)
+            .bind(expires_at)
+            .execute(&*self.pool)
+            .await?;
+        Ok(token)
     }
 
-    /// Look up a session by `token`.
-    ///
-    /// Returns the stored username if the session exists and is not expired.
-    /// Refreshes `last_accessed` on a successful lookup.
-    pub fn get(&self, token: &str) -> Option<String> {
-        // Periodically evict stale sessions.
-        let n = self.access_count.fetch_add(1, Ordering::Relaxed);
-        if n > 0 && n.is_multiple_of(1_000) {
-            self.evict_expired();
+    /// Look up and refresh a session. Expired records are removed.
+    pub async fn get(&self, token: &str) -> Result<Option<Session>, sqlx::Error> {
+        let now = now_secs();
+        let session: Option<(String, String)> = sqlx::query_as(
+            "SELECT username, csrf_token FROM sessions WHERE token = $1 AND expires_at > $2",
+        )
+        .bind(token)
+        .bind(now)
+        .fetch_optional(&*self.pool)
+        .await?;
+        if session.is_none() {
+            sqlx::query("DELETE FROM sessions WHERE token = $1")
+                .bind(token)
+                .execute(&*self.pool)
+                .await?;
+            return Ok(None);
         }
-
-        if let Some(mut entry) = self.sessions.get_mut(token) {
-            if entry.last_accessed.elapsed() < SESSION_TTL {
-                entry.last_accessed = Instant::now();
-                return Some(entry.username.clone());
-            }
-        }
-        None
+        sqlx::query("UPDATE sessions SET expires_at = $1 WHERE token = $2")
+            .bind(now + SESSION_TTL_SECS as i64)
+            .bind(token)
+            .execute(&*self.pool)
+            .await?;
+        Ok(session.map(|(username, csrf_token)| Session {
+            username,
+            csrf_token,
+        }))
     }
 
-    /// Remove a session (logout).
-    pub fn remove(&self, token: &str) {
-        self.sessions.remove(token);
-    }
-
-    /// Evict all sessions whose `last_accessed` is older than [`SESSION_TTL`].
-    pub fn evict_expired(&self) {
-        self.sessions
-            .retain(|_, s| s.last_accessed.elapsed() < SESSION_TTL);
-    }
-
-    /// Return the number of active sessions (including possibly stale ones not yet evicted).
-    pub fn count(&self) -> usize {
-        self.sessions.len()
+    /// Delete a session at logout.
+    pub async fn remove(&self, token: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sessions WHERE token = $1")
+            .bind(token)
+            .execute(&*self.pool)
+            .await?;
+        Ok(())
     }
 }
 
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Extract the `session` cookie value from a `Cookie:` header string.
-///
-/// Returns `None` if the header is absent or the cookie is not present.
 pub fn extract_session_cookie(cookie_header: Option<&str>) -> Option<&str> {
     let header = cookie_header?;
-    for part in header.split(';') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("session=") {
-            return Some(val);
-        }
-    }
-    None
+    header
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("session="))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
 
-    #[test]
-    fn create_and_get_session() {
-        let store = SessionStore::new();
-        let token = store.create("alice".to_string());
-        assert_eq!(store.get(&token), Some("alice".to_string()));
+    async fn store() -> SessionStore {
+        SessionStore::new(Arc::new(db::init_pool("sqlite::memory:", 2).await.unwrap()))
     }
 
-    #[test]
-    fn unknown_token_returns_none() {
-        let store = SessionStore::new();
-        assert!(store.get("nonexistent").is_none());
+    #[tokio::test]
+    async fn create_and_get_session() {
+        let store = store().await;
+        let token = store.create("alice".to_string()).await.unwrap();
+        assert_eq!(store.get(&token).await.unwrap().unwrap().username, "alice");
     }
 
-    #[test]
-    fn remove_session() {
-        let store = SessionStore::new();
-        let token = store.create("bob".to_string());
-        store.remove(&token);
-        assert!(store.get(&token).is_none());
+    #[tokio::test]
+    async fn remove_session() {
+        let store = store().await;
+        let token = store.create("bob".to_string()).await.unwrap();
+        store.remove(&token).await.unwrap();
+        assert!(store.get(&token).await.unwrap().is_none());
     }
 
     #[test]
     fn extract_session_cookie_finds_value() {
-        let hdr = "theme=dark; session=abc123; lang=en";
-        assert_eq!(extract_session_cookie(Some(hdr)), Some("abc123"));
-    }
-
-    #[test]
-    fn extract_session_cookie_absent() {
-        assert!(extract_session_cookie(Some("theme=dark")).is_none());
-        assert!(extract_session_cookie(None).is_none());
+        assert_eq!(
+            extract_session_cookie(Some("theme=dark; session=abc123; lang=en")),
+            Some("abc123")
+        );
     }
 }

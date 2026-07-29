@@ -71,6 +71,25 @@ impl HttpRequest {
         })
     }
 
+    /// Look up a URL-encoded form value in the request body.
+    ///
+    /// This is intentionally small and only used by the server-rendered HTML
+    /// forms. JSON APIs should deserialize their request bodies directly.
+    pub fn form_param(&self, key: &str) -> Option<String> {
+        std::str::from_utf8(&self.body)
+            .ok()?
+            .split('&')
+            .find_map(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                let k = kv.next()?;
+                if percent_decode(k) == key {
+                    Some(percent_decode(kv.next().unwrap_or("")))
+                } else {
+                    None
+                }
+            })
+    }
+
     /// Return a path parameter captured by the router.
     ///
     /// For example, with the pattern `/users/:id` and the path `/users/42`,
@@ -161,6 +180,17 @@ mod tests {
     fn query_param_no_query_string() {
         let req = make_request(Method::GET, "/path", b"");
         assert!(req.query_param("any").is_none());
+    }
+
+    #[test]
+    fn form_param_decodes_urlencoded_values() {
+        let req = make_request(
+            Method::POST,
+            "/ui/items",
+            b"name=hello+world&_csrf=token%2D123",
+        );
+        assert_eq!(req.form_param("name").as_deref(), Some("hello world"));
+        assert_eq!(req.form_param("_csrf").as_deref(), Some("token-123"));
     }
 
     #[test]

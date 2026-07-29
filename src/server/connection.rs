@@ -40,7 +40,6 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
-use sqlx::SqlitePool;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{watch, Semaphore};
 use tower::ServiceBuilder;
@@ -67,8 +66,8 @@ use crate::templates::TemplateEngine;
 /// the [`handle_connection`] signature within clippy's argument-count limit.
 #[derive(Clone)]
 pub struct AppState {
-    /// SQLite connection pool.
-    pub db_pool: Arc<SqlitePool>,
+    /// Shared SQLite or PostgreSQL connection pool.
+    pub db_pool: Arc<db::DbPool>,
     /// JWT signing / verification keys.
     pub jwt: Arc<JwtSecret>,
     /// Prometheus-compatible server metrics counters.
@@ -290,7 +289,7 @@ pub async fn handle_connection<S>(
 /// `db` and `jwt` are shared via `Arc` clones captured in route closures.
 pub(crate) fn build_router(
     cfg: &ServerConfig,
-    db: Arc<SqlitePool>,
+    db: Arc<db::DbPool>,
     jwt: Arc<JwtSecret>,
     metrics: Arc<Metrics>,
     sessions: Arc<SessionStore>,
@@ -300,11 +299,10 @@ pub(crate) fn build_router(
     let mut router = Router::new();
 
     // Auth credentials from config (moved out of hard-coded strings).
-    let cfg_auth_username = cfg.auth_username.clone();
-    let cfg_auth_password = cfg.auth_password.clone();
-
     router.get("/", |_req| async {
-        ResponseBuilder::ok().text("Hello from rust-highperf-server\n")
+        ResponseBuilder::new(StatusCode::FOUND)
+            .header("location", "/ui/index")
+            .empty()
     });
 
     router.get("/health", |_req| async {
@@ -355,10 +353,10 @@ pub(crate) fn build_router(
     // variables (see ServerConfig).  In production, replace with a database
     // lookup against hashed passwords.
     let jwt_for_token = Arc::clone(&jwt);
+    let db_for_token = Arc::clone(&db);
     router.post("/auth/token", move |req| {
         let jwt = Arc::clone(&jwt_for_token);
-        let expected_user = cfg_auth_username.clone();
-        let expected_pass = cfg_auth_password.clone();
+        let pool = Arc::clone(&db_for_token);
         async move {
             #[derive(serde::Deserialize)]
             struct LoginPayload {
@@ -372,9 +370,16 @@ pub(crate) fn build_router(
                         .json(&serde_json::json!({"error": "invalid JSON body"}))
                 }
             };
-            if payload.username != expected_user || payload.password != expected_pass {
-                return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
-                    .json(&serde_json::json!({"error": "invalid credentials"}));
+            match db::verify_user(&pool, &payload.username, &payload.password).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ResponseBuilder::new(StatusCode::UNAUTHORIZED)
+                        .json(&serde_json::json!({"error": "invalid credentials"}));
+                }
+                Err(e) => {
+                    error!(err = %e, "user verification failed");
+                    return ResponseBuilder::internal_error().empty();
+                }
             }
             match jwt.create_token(&payload.username) {
                 Ok(token) => ResponseBuilder::ok().json(&serde_json::json!({"token": token})),
@@ -518,10 +523,14 @@ pub(crate) fn build_router(
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
-                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user {
-                    ctx.insert("session_user", u);
+                if let Some(ref session) = session {
+                    ctx.insert("session_user", &session.username);
+                    ctx.insert("csrf_token", &session.csrf_token);
                 }
                 engine.render("index.html", &ctx)
             }
@@ -539,14 +548,14 @@ pub(crate) fn build_router(
 
         // POST /ui/login — verify credentials, set session cookie
         let e = engine.clone();
+        let db_login = Arc::clone(&db);
         let sess_login = Arc::clone(&sessions);
-        let login_user = cfg.auth_username.clone();
-        let login_pass = cfg.auth_password.clone();
+        let ui_cookie_secure = cfg.tls_cert_path.is_some() && cfg.tls_key_path.is_some();
         router.post("/ui/login", move |req| {
             let engine = e.clone();
             let sessions = Arc::clone(&sess_login);
-            let expected_user = login_user.clone();
-            let expected_pass = login_pass.clone();
+            let pool = Arc::clone(&db_login);
+            let cookie_secure = ui_cookie_secure;
             async move {
                 // Parse application/x-www-form-urlencoded body.
                 let body_str = String::from_utf8_lossy(&req.body).to_string();
@@ -566,33 +575,62 @@ pub(crate) fn build_router(
                         }
                     }
                 }
-                if username == expected_user && password == expected_pass {
-                    let token = sessions.create(username.clone());
-                    let cookie =
-                        format!("session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600");
-                    ResponseBuilder::new(hyper::StatusCode::FOUND)
-                        .header("location", "/ui/items")
-                        .header("set-cookie", &cookie)
-                        .empty()
-                } else {
+                match db::verify_user(&pool, &username, &password).await {
+                    Ok(true) => match sessions.create(username).await {
+                        Ok(token) => {
+                            let secure = if cookie_secure {
+                                "; Secure"
+                            } else {
+                                ""
+                            };
+                            let cookie = format!(
+                                "session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600{secure}"
+                            );
+                            ResponseBuilder::new(hyper::StatusCode::FOUND)
+                                .header("location", "/ui/items")
+                                .header("set-cookie", &cookie)
+                                .empty()
+                        }
+                        Err(e) => {
+                            error!(err = %e, "failed to create browser session");
+                            ResponseBuilder::internal_error().empty()
+                        }
+                    },
+                    Ok(false) => {
                     let mut ctx = tera::Context::new();
                     ctx.insert("flash", "Invalid username or password.");
                     ctx.insert("flash_type", "error");
                     engine.render("login.html", &ctx)
+                    }
+                    Err(e) => {
+                        error!(err = %e, "user verification failed");
+                        ResponseBuilder::internal_error().empty()
+                    }
                 }
             }
         });
 
-        // GET /ui/logout — destroy session
+        // POST /ui/logout — destroy session (CSRF-protected)
         let sess_logout = Arc::clone(&sessions);
-        router.get("/ui/logout", move |req| {
+        router.post("/ui/logout", move |req| {
             let sessions = Arc::clone(&sess_logout);
             async move {
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
+                let csrf = req.form_param("_csrf").unwrap_or_default();
+                if session.as_ref().is_none_or(|s| s.csrf_token != csrf) {
+                    return ResponseBuilder::new(StatusCode::FORBIDDEN)
+                        .text("CSRF validation failed\n");
+                }
                 if let Some(t) = token.as_deref() {
-                    sessions.remove(t);
+                    if let Err(e) = sessions.remove(t).await {
+                        error!(err = %e, "failed to remove session");
+                    }
                 }
                 ResponseBuilder::new(hyper::StatusCode::FOUND)
                     .header("location", "/ui/login")
@@ -613,11 +651,15 @@ pub(crate) fn build_router(
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
-                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
                 let items = db::list_items(&pool).await.unwrap_or_default();
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user {
-                    ctx.insert("session_user", u);
+                if let Some(ref session) = session {
+                    ctx.insert("session_user", &session.username);
+                    ctx.insert("csrf_token", &session.csrf_token);
                 }
                 ctx.insert("items", &items);
                 // Pass any flash message from query string.
@@ -640,10 +682,19 @@ pub(crate) fn build_router(
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
-                if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
+                let csrf = req.form_param("_csrf").unwrap_or_default();
+                let Some(session) = session else {
                     return ResponseBuilder::new(hyper::StatusCode::FOUND)
                         .header("location", "/ui/login")
                         .empty();
+                };
+                if session.csrf_token != csrf {
+                    return ResponseBuilder::new(StatusCode::FORBIDDEN)
+                        .text("CSRF validation failed\n");
                 }
                 let body_str = String::from_utf8_lossy(&req.body).to_string();
                 let mut name = String::new();
@@ -689,10 +740,19 @@ pub(crate) fn build_router(
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
-                if token.as_deref().and_then(|t| sessions.get(t)).is_none() {
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
+                let csrf = req.form_param("_csrf").unwrap_or_default();
+                let Some(session) = session else {
                     return ResponseBuilder::new(hyper::StatusCode::FOUND)
                         .header("location", "/ui/login")
                         .empty();
+                };
+                if session.csrf_token != csrf {
+                    return ResponseBuilder::new(StatusCode::FORBIDDEN)
+                        .text("CSRF validation failed\n");
                 }
                 let id = req.path_param("id").unwrap_or("").to_string();
                 match db::delete_item(&pool, &id).await {
@@ -721,10 +781,14 @@ pub(crate) fn build_router(
                 let token = req
                     .header("cookie")
                     .and_then(|c| extract_session_cookie(Some(c)).map(str::to_owned));
-                let session_user = token.as_deref().and_then(|t| sessions.get(t));
+                let session = match token.as_deref() {
+                    Some(t) => sessions.get(t).await.ok().flatten(),
+                    None => None,
+                };
                 let mut ctx = tera::Context::new();
-                if let Some(ref u) = session_user {
-                    ctx.insert("session_user", u);
+                if let Some(ref session) = session {
+                    ctx.insert("session_user", &session.username);
+                    ctx.insert("csrf_token", &session.csrf_token);
                 }
                 ctx.insert(
                     "requests_total",
@@ -857,8 +921,12 @@ mod tests {
         })
     }
 
-    async fn test_db() -> Arc<SqlitePool> {
+    async fn test_db() -> Arc<db::DbPool> {
         Arc::new(crate::db::init_pool("sqlite::memory:", 5).await.unwrap())
+    }
+
+    async fn test_sessions() -> Arc<SessionStore> {
+        Arc::new(SessionStore::new(test_db().await))
     }
 
     fn test_jwt() -> Arc<JwtSecret> {
@@ -888,7 +956,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -905,13 +973,13 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
         let resp = router.dispatch(make_req(Method::GET, "/")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(body_str(resp).await.contains("rust-highperf-server"));
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(resp.headers().get("location").unwrap(), "/ui/index");
     }
 
     #[tokio::test]
@@ -922,7 +990,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -939,7 +1007,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -963,7 +1031,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -980,7 +1048,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -998,7 +1066,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
@@ -1017,7 +1085,7 @@ mod tests {
             test_db().await,
             test_jwt(),
             Metrics::new(),
-            Arc::new(SessionStore::new()),
+            test_sessions().await,
             None,
             None,
         );
