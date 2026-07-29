@@ -37,7 +37,11 @@ jobs:
       - name: Build
         run: cargo build --all-features
       - name: Unit tests
-        run: cargo test --lib --all-features
+        # The postgres feature selects the PostgreSQL backend, while unit
+        # tests deliberately use isolated SQLite in-memory databases. Run
+        # that suite with the default backend; PostgreSQL is tested below
+        # against the CI service.
+        run: cargo test --lib
       - name: Integration tests (sequential to avoid port exhaustion)
         run: |
           cargo test --test phase1_integration -- --test-threads=1

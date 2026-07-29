@@ -229,12 +229,10 @@ impl RouteEntry {
                         return None;
                     }
                 }
-                PathSegment::Param(name) => match path_segs.get(i) {
-                    Some(s) => {
-                        params.insert(name.clone(), (*s).to_string());
-                    }
-                    None => return None,
-                },
+                PathSegment::Param(name) => {
+                    let s = path_segs.get(i)?;
+                    params.insert(name.clone(), (*s).to_string());
+                }
                 PathSegment::Wildcard(name) => {
                     // Capture remaining segments (may be empty if wildcard is
                     // at the end and the URL ends right at the prefix).
