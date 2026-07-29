@@ -1,17 +1,19 @@
 # Stage 1: Builder
 FROM rust:1.94-slim AS builder
 
+ARG FEATURES=""
+
 WORKDIR /app
 
 # Cache dependency compilation separately from source
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
+RUN cargo build --release --features "$FEATURES"
 RUN rm -f target/release/deps/rust_highperf_server*
 
 # Build the actual source
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --features "$FEATURES"
 
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim AS runtime
@@ -25,6 +27,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/rust-highperf-server .
 COPY --from=builder /app/static ./static
+COPY --from=builder /app/templates ./templates
 
 EXPOSE 8080
 

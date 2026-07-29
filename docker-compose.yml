@@ -1,0 +1,32 @@
+services:
+  server:
+    build:
+      context: .
+      args:
+        FEATURES: postgres
+    environment:
+      DATABASE_URL: postgres://threadline:threadline@postgres/threadline
+      AUTH_USERNAME: admin
+      AUTH_PASSWORD_HASH: ${AUTH_PASSWORD_HASH:?Set an Argon2id hash before starting}
+      JWT_SECRET: ${JWT_SECRET:?Set a long random JWT secret before starting}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: threadline
+      POSTGRES_USER: threadline
+      POSTGRES_PASSWORD: threadline
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threadline -d threadline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
