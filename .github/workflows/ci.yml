@@ -14,6 +14,22 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: threadline_test
+          POSTGRES_USER: threadline
+          POSTGRES_PASSWORD: threadline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U threadline -d threadline_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://threadline:threadline@localhost:5432/threadline_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,6 +45,10 @@ jobs:
           cargo test --test phase4_integration -- --test-threads=1
           cargo test --test phase5_integration -- --test-threads=1
           cargo test --test phase6_integration -- --test-threads=1
+          cargo test --test phase7_integration -- --test-threads=1
+          cargo test --test phase8_integration -- --test-threads=1
+          cargo test --test proxy_integration -- --test-threads=1
+          cargo test --test postgres_integration --features postgres -- --test-threads=1
       - name: Criterion benchmarks (compile-only)
         run: cargo bench --no-run
 
@@ -41,7 +61,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format
