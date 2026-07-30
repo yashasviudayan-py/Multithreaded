@@ -354,9 +354,6 @@ async fn http_redirect_returns_308_with_location() {
     };
 
     with_server(cfg, |tls_addr| async move {
-        // Give the redirect server a moment to bind (it spawns inside accept_loop).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
         let client = reqwest::Client::builder()
             // Do NOT follow redirects — we want to inspect the 308 response itself.
             .redirect(reqwest::redirect::Policy::none())
@@ -364,7 +361,22 @@ async fn http_redirect_returns_308_with_location() {
             .unwrap();
 
         let url = format!("http://localhost:{redirect_port}/health");
-        let resp = client.get(&url).send().await.unwrap();
+        // The redirect listener is spawned after the main TLS listener signals
+        // readiness. Poll with a bounded timeout instead of relying on a fixed
+        // sleep, which is prone to races on busy CI runners.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match client.get(&url).send().await {
+                    Ok(response) => return response,
+                    Err(err) if err.is_connect() => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    Err(err) => panic!("redirect request failed: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("redirect listener did not become ready within 2 seconds");
 
         assert_eq!(resp.status(), 308);
 
